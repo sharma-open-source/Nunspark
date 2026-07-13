@@ -12,11 +12,15 @@ What it does:
   5. Sanity-checks the first few greedy tokens against the full-load mlx-lm run.
 
 REQUIREMENTS for the model:
-  - A supported architecture: Llama (SmolLM2, TinyLlama, Llama-3.2-1B...),
-    Qwen3 dense (Qwen3-0.6B ... Qwen3-32B), or Qwen3-MoE with selective-expert
-    streaming (e.g. Qwen3-30B-A3B). Multimodal / Gemma / Phi / Mistral are
-    NOT supported yet. For an MoE model, (re)pack with --repack to get the
-    selective-expert layout (only the fired experts are streamed per sweep).
+  - A supported decoder-only architecture. Many families are registered, incl.
+    Llama (SmolLM2, TinyLlama, Llama-3.2-1B...), Mistral, Phi-3, Qwen2,
+    Qwen3 dense (Qwen3-0.6B ... Qwen3-32B), Qwen3-MoE with selective-expert
+    streaming (e.g. Qwen3-30B-A3B), Gemma3/Gemma4, GLM/GLM-4, OLMo-2, InternLM3,
+    gpt-oss, and more. For the live list, see
+    nunspark.architectures.supported_model_types(); the packer will reject an
+    unsupported model_type. Multimodal models are NOT supported (text decoders
+    only). For an MoE model, (re)pack with --repack to get the selective-expert
+    layout (only the fired experts are streamed per sweep).
   - Quantized (4-bit) OR fp16/bf16 MLX models are both supported.
     For 4-bit, use an mlx-community *-4bit repo, or convert:
       python -m mlx_lm convert --hf-path <repo> -q --mlx-path <dir>
