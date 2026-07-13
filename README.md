@@ -39,8 +39,7 @@ that this regime rewards deep speculation differently than GPU serving does.
 
 Speculative decoding is lossless (identical output distribution to running the target alone),
 so this is a straight 3–5× speedup, not a quality tradeoff. See
-[requirment.md](requirment.md) and
-[docs/superpowers/specs/2026-06-05-nunspark-speculative-streaming-design.md](docs/superpowers/specs/2026-06-05-nunspark-speculative-streaming-design.md)
+[requirment.md](requirment.md) 
 for the full analysis and caveats (vocab lock-in between draft/target, why the win concentrates
 in the 13–30B band rather than the hero 70B number, etc).
 
@@ -162,7 +161,7 @@ Key flags:
 | `--budget` | Resident weight budget (e.g. `512MB`, `4GB`). Lower = more disk reads, less RAM. |
 | `--kv-budget` | Resident KV-cache budget (default: unbounded). |
 | `--kv-bits {4,8}` | Quantize the KV cache (default fp16). |
-| `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations — see [docs/superpowers/specs/2026-06-06-nunspark-parallel-io-warming-design.md](docs/superpowers/specs/2026-06-06-nunspark-parallel-io-warming-design.md)). |
+| `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations)). |
 | `--draft-model <path>` | Enable speculative decoding against a smaller draft model (must share a tokenizer with the target). |
 | `--eagle-drafter <path>` | Use a trained EAGLE feature-level drafter instead of a full draft model. |
 | `--num-draft-tokens` | Draft tokens proposed per speculative sweep (default 16 — the "deep-K" lever described above). |
@@ -254,14 +253,9 @@ src/nunspark/
   server.py                                                  # OpenAI-compatible API server
   webapp/                                                    # FastAPI batch-generation UI
   cli.py                                                     # `nunspark` entry point (pack/generate/serve/web)
-docs/superpowers/{specs,plans}/                              # design specs and implementation plans, one per feature
 scripts/                                                     # standalone benchmarking/probe scripts
 tests/                                                       # pytest suite, mirrors src/nunspark modules
 ```
-
-Each shipped feature has a paired spec + plan doc under `docs/superpowers/` — check there first
-for the rationale behind a specific module (e.g. why the prefix cache is single-slot, how KV
-quantization interacts with tree speculative decoding, gpt-oss's quantized-KV opt-out).
 
 ## Known limitations
 
