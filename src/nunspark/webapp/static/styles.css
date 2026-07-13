@@ -1,0 +1,27 @@
+:root { --bg:#0f1115; --panel:#171a21; --ink:#e6e9ef; --muted:#8a91a0; --accent:#5b9cff; --ok:#3fb950; --err:#f85149; }
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.5 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+header { display:flex; align-items:baseline; gap:.6rem; padding:1rem 1.25rem; border-bottom:1px solid #222; }
+header h1 { margin:0; font-size:1.25rem; }
+.tag { color:var(--muted); }
+main { display:grid; grid-template-columns: 380px 1fr; gap:1px; background:#222; min-height: calc(100vh - 58px); }
+section { background:var(--panel); padding:1.1rem; overflow:auto; }
+label { display:block; margin:.5rem 0; color:var(--muted); }
+input, select, textarea, button { width:100%; background:#0d0f14; color:var(--ink); border:1px solid #2a2f3a; border-radius:8px; padding:.5rem; font:inherit; }
+.row { display:flex; gap:.6rem; } .row label { flex:1; }
+button { background:var(--accent); color:#fff; border:none; cursor:pointer; font-weight:600; }
+button:hover { filter:brightness(1.08); }
+fieldset.spec { border:1px solid #2a2f3a; border-radius:10px; }
+.dropzone { border:1.5px dashed #2a2f3a; border-radius:10px; padding:1.25rem; text-align:center; color:var(--muted); cursor:pointer; }
+.dropzone.drag { border-color:var(--accent); color:var(--ink); }
+#file-list, #jobs { list-style:none; padding:0; margin:.5rem 0; }
+#jobs li { display:flex; justify-content:space-between; align-items:center; padding:.5rem; border:1px solid #2a2f3a; border-radius:8px; margin-bottom:.4rem; cursor:pointer; }
+#jobs li.active { border-color:var(--accent); }
+.badge { font-size:.75rem; padding:.1rem .5rem; border-radius:99px; }
+.badge.queued{background:#333;} .badge.running{background:var(--accent);} .badge.done{background:var(--ok);} .badge.error{background:var(--err);} .badge.cancelled{background:#555;}
+.results-head { display:flex; justify-content:space-between; align-items:center; }
+#output { background:#0d0f14; border:1px solid #2a2f3a; border-radius:10px; padding:1rem; min-height:240px; white-space:pre-wrap; }
+.metrics { margin-top:.8rem; display:grid; grid-template-columns:repeat(2,1fr); gap:.4rem; }
+.metrics div { background:#0d0f14; border:1px solid #2a2f3a; border-radius:8px; padding:.5rem; }
+.metrics b { color:var(--accent); }
+.hidden { display:none; }

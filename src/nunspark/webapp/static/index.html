@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NunSpark</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header><h1>NunSpark</h1><span class="tag">long-generation studio</span></header>
+  <main>
+    <section class="config">
+      <label>Model
+        <select id="model"></select>
+      </label>
+      <details class="pack">
+        <summary>Pack a model</summary>
+        <select id="unpacked"></select>
+        <input id="pack-source" placeholder="or HF id / path" />
+        <button id="pack-btn" type="button">Pack</button>
+        <span id="pack-status"></span>
+      </details>
+
+      <fieldset class="spec">
+        <legend>Speed</legend>
+        <label>Draft model
+          <select id="draft"><option value="">none (plain)</option></select>
+           <input id="draft-source" placeholder="or HF id / path" />
+        </label>
+        <label>Preset
+          <select id="preset">
+            <option value="lossless">lossless</option>
+            <option value="fast">fast</option>
+          </select>
+        </label>
+        <details>
+          <summary>Advanced</summary>
+          <label>budget <input id="budget" value="4GB" /></label>
+          <label>kv-bits <input id="kv-bits" type="number" placeholder="off" /></label>
+          <label>accept-top-k <input id="accept-top-k" type="number" placeholder="preset" /></label>
+          <label>num-draft-tokens <input id="num-draft-tokens" type="number" placeholder="preset" /></label>
+        </details>
+      </fieldset>
+
+      <label>Instruction (applied to every file)
+        <textarea id="instruction" rows="3" placeholder="Summarize this document."></textarea>
+      </label>
+      <label><input type="checkbox" id="chat-template" checked /> Wrap each file in chat template</label>
+
+      <div class="row">
+        <label>max tokens <input id="max-tokens" type="number" value="2048" /></label>
+        <label>temperature <input id="temp" type="number" step="0.1" value="0.0" /></label>
+      </div>
+      <label>Output folder (absolute path)
+        <input id="output-dir" placeholder="/Users/you/nunspark-out" />
+      </label>
+
+      <div class="dropzone" id="dropzone">Drop files here or click to choose
+        <input type="file" id="files" multiple hidden />
+      </div>
+      <ul id="file-list"></ul>
+
+      <button id="run" type="button">Run batch</button>
+    </section>
+
+    <section class="results">
+      <div class="results-head">
+        <h2>Jobs</h2>
+        <label><input type="checkbox" id="metrics-toggle" /> Metrics</label>
+      </div>
+      <ul id="jobs"></ul>
+      <h2>Output <small id="active-job"></small></h2>
+      <pre id="output"></pre>
+      <div id="metrics" class="metrics hidden"></div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
