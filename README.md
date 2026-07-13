@@ -10,7 +10,9 @@ disk-aware speculative decoding, this makes large (13–30B, 4-bit) models usabl
 per second instead of not-at-all — on machines that could never hold the model in RAM.
 
 > This is an experimental research project, not a production inference server. Read
-> [requirment.md](requirment.md) for the honest story of what worked and what didn't.
+> [requirment.md](requirment.md) for the honest story of what worked and what didn't, and
+> [report.md](report.md) for measured benchmarks on a real 16 GB M4 (Qwen2.5-32B and
+> Llama-3.3-70B, 4-bit).
 
 ---
 
@@ -41,6 +43,13 @@ so this is a straight 3–5× speedup, not a quality tradeoff. See
 [docs/superpowers/specs/2026-06-05-nunspark-speculative-streaming-design.md](docs/superpowers/specs/2026-06-05-nunspark-speculative-streaming-design.md)
 for the full analysis and caveats (vocab lock-in between draft/target, why the win concentrates
 in the 13–30B band rather than the hero 70B number, etc).
+
+**Measured results** ([report.md](report.md)) confirm the thesis on a real 16 GB M4: a streamed
+Qwen2.5-32B-4bit reaches **~0.9–1.1 tok/s losslessly** (and ~2.6–2.8 tok/s in approximate
+top-k mode), and a streamed Llama-3.3-70B-4bit stays usable at **~0.9 tok/s** — both while
+keeping only ~1.1–1.4 GB of weights resident out of 18–40 GB models. The headline finding
+from those runs: **draft–target agreement, not resident cache size, is the primary determinant
+of throughput.**
 
 ## Design principles
 
