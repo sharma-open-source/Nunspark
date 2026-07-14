@@ -76,6 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="skip chat template; encode prompt as-is (default: apply if available)")
     p_gen.add_argument("--metrics", action="store_true",
                        help="print tok/s, peak memory, cache and KV stats after generation")
+    p_gen.add_argument("--expert-trace", default=None,
+                       help="write a JSONL trace of fired MoE experts per layer/call to this "
+                            "path (M1 locality measurement; off by default, no overhead when unset)")
+    p_gen.add_argument("--expert-cache-frac", type=float, default=0.9,
+                       help="fraction of --budget reserved for the LRU expert-piece cache "
+                            "region on selectively-packed MoE models (default 0.9; ignored "
+                            "for models without expert pieces)")
+    p_gen.add_argument("--expert-prefetch", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="temporal expert prefetch (plan4 M3a): overlap fired-expert "
+                            "loads with attention/router compute by speculatively "
+                            "prefetching the previous pass's per-layer expert sets "
+                            "(default on; --no-expert-prefetch to disable)")
 
     p_serve = sub.add_parser("serve", help="serve a packed model behind an OpenAI v1-compatible API")
     p_serve.add_argument("packed_dir")
@@ -136,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
             prefetch=not args.no_prefetch,
             io_threads=args.io_threads,
             warm_window=args.warm_window,
+            expert_trace=args.expert_trace,
+            expert_cache_frac=args.expert_cache_frac,
+            expert_prefetch=args.expert_prefetch,
         )
         try:
             from .generate import check_kv_quant_support

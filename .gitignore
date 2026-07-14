@@ -11,3 +11,5 @@ build/
 .claude
 .ruff_cache
 docs/*
+packed
+scripts/results

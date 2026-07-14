@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -78,18 +81,67 @@ class StreamingEngine:
         prefetch: bool = True,
         io_threads: int = 1,
         warm_window: int = 1,
+        expert_trace: str | Path | None = None,
+        expert_cache_frac: float = 0.9,
+        expert_prefetch: bool = True,
     ):
         self.manifest = manifest
         spec = get_architecture(manifest.model_type)
         self._spec = spec
         self.args = spec.args_cls.from_dict(manifest.config)
         self.store = PieceStore(root, manifest)
+
+        # Two-region cache wiring (plan4 M2). Selectively-packed MoE models get
+        # an LRU expert region sized expert_cache_frac * budget; models without
+        # expert pieces pass frac=0.0 so the main (MRU) region keeps the whole
+        # budget — dense behavior unchanged. Core pieces are pinned
+        # unconditionally when they fit the main region's cap (they are tiny —
+        # <1 GB for the 30B — yet re-read every layer of every token otherwise);
+        # sizes come from the piece files on disk, nothing hardcoded. embed and
+        # norm/head never enter the cache: they are loaded once below and stay
+        # permanently resident, i.e. already pinned by construction.
+        core_pids = [
+            Manifest.layer_core_piece_id(l)
+            for l in range(manifest.num_layers)
+            if manifest.has_piece(Manifest.layer_core_piece_id(l))
+        ]
+        frac = float(expert_cache_frac) if core_pids else 0.0
+        pinned: list[str] = []
+        if core_pids:
+            main_cap = int(budget_bytes) - int(int(budget_bytes) * frac)
+            core_bytes = sum(
+                os.stat(self.store.path_for(p)).st_size for p in core_pids
+            )
+            if core_bytes <= main_cap:
+                pinned = core_pids
         self.cache = PieceCache(
-            self.store.load, budget_bytes=budget_bytes,
+            self.store.load, budget_bytes=budget_bytes, pinned=pinned,
             io_threads=io_threads, pather=self.store.path_for,
+            expert_frac=frac,
         )
         self._prefetch = prefetch
         self._warm_window = max(1, warm_window)
+
+        # Temporal expert prefetch (plan4 M3a). Per MoE layer we remember the
+        # fired-expert set from the most recent forward pass; when the window
+        # prefetcher warms layer L+1..W's cores it also enqueues those layers'
+        # remembered expert sets as SPECULATIVE prefetches, overlapping the
+        # 85-120 MB/token of expert misses with attention+router compute instead
+        # of stalling on them serially after the router. M1: consecutive
+        # verify-pass fired-set overlap is 0.74-0.80 (one spec verify pass = one
+        # forward over K+1 tokens), so the previous pass's per-layer union is a
+        # strong predictor. State lives here (not the cache) and resets at each
+        # generation's prefill (kv offset 0); correctness never depends on it —
+        # the real router still decides and _scatter_experts always loads the
+        # actually-fired experts, so a wrong guess only wastes bandwidth.
+        self._expert_prefetch = expert_prefetch
+        # Per MoE layer: (fired_expert_ids, from_multi_token_pass). The bool gates
+        # Defect 1 — only multi-token history seeds speculative prefetch.
+        self._fired_history: dict[int, tuple[list[int], bool]] = {}
+        # Set per forward() from the input token count (B*L); gates speculative
+        # issuance to multi-token passes only (Defect 2, consume side).
+        self._cur_pass_multi = False
+        self._stall_seconds = 0.0    # cumulative router-output -> experts-resident wait
         self._block_factory = spec.block_factory
         self._layer_key_fn = spec.layer_key_fn
         self._embed_scale = spec.embed_scale(self.args) if spec.embed_scale else None
@@ -121,6 +173,14 @@ class StreamingEngine:
             spec.num_experts(self.args) if spec.num_experts else getattr(self.args, "num_experts", None)
         )
         self._moe_route = spec.moe_route or _default_moe_route
+
+        # opt-in expert-trace instrumentation (M1 locality measurement). Off by
+        # default: _trace_fh stays None, so _moe_layer_forward pays one `if` check
+        # and nothing else. Buffered JSONL, flushed every _TRACE_FLUSH_EVERY records
+        # or on close() so tracing doesn't distort timing.
+        self._trace_fh = open(Path(expert_trace), "w") if expert_trace is not None else None
+        self._trace_buf: list[str] = []
+        self._trace_t = 0
 
         quant = manifest.config.get("quantization")  # None for fp16 models
         self._quant = quant
@@ -197,6 +257,17 @@ class StreamingEngine:
         core = Manifest.layer_core_piece_id(layer)
         return core if self.manifest.has_piece(core) else Manifest.layer_piece_id(layer)
 
+    def _spec_fired(self, layer: int) -> list[int]:
+        """Fired experts remembered for `layer`, but ONLY when that history came
+        from a multi-token pass (Defect 1). Single-token greedy history is a weak
+        per-token guess and must not drive speculative prefetch; multi-token
+        (K-token verify) history keeps working exactly as before."""
+        rec = self._fired_history.get(layer)
+        if rec is None:
+            return []
+        fired, from_multi = rec
+        return fired if from_multi else []
+
     def _scatter_experts(self, slot, layer: int, fired: list[int]) -> None:
         """Load only the `fired` experts and scatter their rows into full-size,
         zero-filled expert-module buffers, then update the slot. Unfired rows stay
@@ -217,14 +288,38 @@ class StreamingEngine:
                                    dtype=getattr(sw, proj)[comp].dtype)
             for proj, comp in subkeys
         }
+        # Stall instrumentation (plan4 M3): wall time the expert loads spend on
+        # cache.get misses (router-output -> experts-resident). The scatter
+        # assignments below are lazy graph-builds; the real disk wait is inside
+        # get(), which returns only once the piece is materialized+eval'd.
+        t0 = time.monotonic()
         for e in fired:
             piece = self.cache.get(Manifest.layer_expert_piece_id(layer, e))
             for proj, comp in subkeys:
                 bufs[(proj, comp)][e] = piece[f"mlp.{attr}.{proj}.{comp}"]
+        self._stall_seconds += time.monotonic() - t0
         mx.eval(list(bufs.values()))    # force reads now; cached pieces may be evicted next
         flat = {f"mlp.{attr}.{proj}.{comp}": buf
                 for (proj, comp), buf in bufs.items()}
         slot.update(tree_unflatten(list(flat.items())))
+
+    _TRACE_FLUSH_EVERY = 256  # records buffered before a write, so tracing doesn't distort timing
+
+    def _trace_moe(self, layer: int, fired: list[int], batch_tokens: int) -> None:
+        """Append one JSONL record for this MoE layer call. Only reached when
+        expert_trace was given (see the `if` in _moe_layer_forward)."""
+        self._trace_t += 1
+        self._trace_buf.append(json.dumps(
+            {"t": self._trace_t, "layer": layer, "fired": fired, "batch_tokens": batch_tokens}
+        ))
+        if len(self._trace_buf) >= self._TRACE_FLUSH_EVERY:
+            self._trace_flush()
+
+    def _trace_flush(self) -> None:
+        if self._trace_buf:
+            self._trace_fh.write("\n".join(self._trace_buf) + "\n")
+            self._trace_fh.flush()
+            self._trace_buf.clear()
 
     def _moe_layer_forward(self, h, mask, kv, layer: int):
         """Selective MoE layer: load core, run the router, load only the fired
@@ -240,8 +335,34 @@ class StreamingEngine:
             self.cache.prefetch([self._prefetch_pid(l) for l in range(layer + 1, hi)])
             if kv is not None:
                 kv.prefetch(list(range(layer + 1, hi)))
+            # M3a: also enqueue the experts layers L+1..W fired on the PREVIOUS
+            # pass as speculative prefetches. _fired_history[l] for l > layer still
+            # holds the prior pass's set (this pass overwrites it only when it
+            # reaches layer l), so this is a true temporal prediction. They ride
+            # the low-priority tier, filling I/O slack behind the demand cores.
+            # Consume-side gate (Defect 2): only a multi-token pass issues these —
+            # a single-token greedy decode issues nothing even if multi-token
+            # history exists (record-side gate in _spec_fired handles the converse).
+            if self._expert_prefetch and self._cur_pass_multi:
+                spec_pids = [
+                    Manifest.layer_expert_piece_id(l, e)
+                    for l in range(layer + 1, hi)
+                    for e in self._spec_fired(l)
+                ]
+                if spec_pids:
+                    self.cache.prefetch(spec_pids, speculative=True)
 
         cache = kv.get(layer) if kv is not None else None
+        h = self._moe_attn_and_mix(slot, layer, h, mask, cache)
+        mx.eval(h)
+        return h
+
+    def _moe_attn_and_mix(self, slot, layer: int, h, mask, cache):
+        """Attention sub-block + router + selective expert mix for one selective
+        MoE layer, given an already-fetched attention `cache` (persistent, in
+        `_moe_layer_forward`; ephemeral batched, in `tree_forward`). Factored out
+        so both call sites share the exact same math — the only thing that
+        differs between them is which cache the attention reads/writes."""
         r = slot.self_attn(slot.input_layernorm(h), mask, cache)
         h = h + r
         x = slot.post_attention_layernorm(h)
@@ -249,17 +370,64 @@ class StreamingEngine:
         gate_logits = getattr(slot.mlp, self._router_attr)(x)
         inds, scores = self._moe_route(self.args, gate_logits)
 
-        # fired set (tiny host sync: inds is [B, L, k])
+        # fired set (tiny host sync: inds is [..., k])
         fired = sorted({int(e) for e in inds.reshape(-1).tolist()})
+        batch_tokens = inds.shape[0] * inds.shape[1]   # B*L positions this pass routed
+        if self._trace_fh is not None:
+            self._trace_moe(layer, fired, batch_tokens)
         self._scatter_experts(slot, layer, fired)
+        if self._expert_prefetch:
+            # Remember this pass's fired set so the NEXT pass can prefetch it.
+            # Recorded here (after any L+1..W speculative prefetch already read the
+            # prior value) so a pass never reads its own freshly-written set.
+            # Tag whether the set came from a MULTI-token pass (B*L > 1): only
+            # multi-token history drives speculative prefetch (Defect 1) — the
+            # per-token guess of a single-token greedy pass is too weak (consecutive
+            # Jaccard ~0.30) and mostly wastes bandwidth, whereas a K-token verify
+            # pass overlaps 0.74-0.80 with the next.
+            self._fired_history[layer] = (fired, batch_tokens > 1)
 
         y = getattr(slot.mlp, self._expert_attr)(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
-        h = h + y
-        mx.eval(h)
-        return h
+        return h + y
+
+    def _maybe_reset_prefetch(self, kv) -> None:
+        """Drop the remembered fired-expert history at a new generation's start.
+        Signal: a persistent KV at offset 0 (fresh sequence prefill). We never
+        reset when kv is None (one-off forwards with no decode state, e.g. tests,
+        should carry history across calls) — stale history only wastes a pass of
+        speculative bandwidth, never correctness, so this is purely a tidy-up."""
+        if not self._expert_prefetch or kv is None:
+            return
+        try:
+            if kv.get(0).offset == 0:
+                self._fired_history.clear()
+        except Exception:
+            pass
+
+    def prefetch_stats(self) -> dict:
+        """Prefetch/stall instrumentation (plan4 M3). `stall_seconds` is the
+        cumulative wall time expert loads waited on cache.get misses (router
+        output -> experts resident); the `speculative` block is the cache's
+        temporal-prefetch counters (issued / used / wasted_bytes)."""
+        return {
+            "stall_seconds": self._stall_seconds,
+            "speculative": self.cache.stats()["speculative"],
+        }
 
     def forward(self, tokens: mx.array, kv=None) -> mx.array:
+        # Advance the cache's speculative-protection epoch: one call per forward
+        # pass, so a speculative expert survives its insertion pass plus exactly
+        # the next pass (the one its temporal prediction is for).
+        self.cache.begin_pass()
+        # Consume-side gate (Defect 2): only a MULTI-token pass may ISSUE
+        # speculative expert prefetch. Recorded here once from the input shape
+        # (B*L) so the per-layer M3a block in _moe_layer_forward can skip issuance
+        # on single-token greedy decode — even when multi-token history exists (as
+        # right after a prefill), where issuing the prefill's giant per-layer unions
+        # would flood the staging buffer and wreck greedy throughput.
+        self._cur_pass_multi = tokens.size > 1
+        self._maybe_reset_prefetch(kv)
         self._lctx.shared_kv.clear()
         self._lctx.target_kv_states.clear()
         h = self._embed(tokens)
@@ -348,6 +516,7 @@ class StreamingEngine:
         Requires `kv` to have been prefilled to `prefix_len` tokens (via `forward`);
         each layer's prefix KV is read to seed the ephemeral batched cache.
         """
+        self.cache.begin_pass()   # advance the speculative-protection epoch (one per pass)
         self._lctx.shared_kv.clear()
         self._lctx.target_kv_states.clear()
         B = token_paths.shape[0]
@@ -358,14 +527,17 @@ class StreamingEngine:
         n = self.manifest.num_layers
         for layer in range(n):
             slot = self._get_slot(layer)
-            # Selectively-packed MoE layers have no whole-layer piece: reassemble the
-            # full layer (core + ALL experts) and run it whole. A tree's fired-expert
-            # union ~ all experts, so selective loading gives no benefit here (spec
-            # non-goal); correctness, not saving, is the goal.
-            if self.manifest.has_piece(Manifest.layer_core_piece_id(layer)):
+            # Selectively-packed MoE layers have no whole-layer piece: load the
+            # core, then mirror _moe_layer_forward's structure — run attention,
+            # route on the B*d verify-pass positions, load only the UNION of
+            # experts fired across the whole batch, run the expert mix. Measured
+            # (docs/plan4-m1-gate-summary.md) the per-K=24-pass fired union is
+            # 51-65% of all experts, so this avoids ~2x the necessary expert
+            # bytes that loading every expert would cost.
+            is_moe = self.manifest.has_piece(Manifest.layer_core_piece_id(layer))
+            if is_moe:
                 core = self.cache.get(Manifest.layer_core_piece_id(layer))
                 slot.update(tree_unflatten(list(core.items())))
-                self._scatter_experts(slot, layer, list(range(self._num_experts)))
             else:
                 weights = self.cache.get(Manifest.layer_piece_id(layer))
                 slot.update(tree_unflatten(list(weights.items())))
@@ -374,6 +546,18 @@ class StreamingEngine:
                 hi = min(layer + 1 + self._warm_window, n)
                 self.cache.prefetch([self._prefetch_pid(l) for l in range(layer + 1, hi)])
                 kv.prefetch(list(range(layer + 1, hi)))
+                # M3a: same temporal expert prefetch as _moe_layer_forward — enqueue
+                # layers L+1..W's PREVIOUS-pass fired sets speculatively. Must read
+                # _fired_history before this pass's _moe_attn_and_mix() below
+                # overwrites layer `layer`'s entry.
+                if is_moe and self._expert_prefetch:
+                    spec_pids = [
+                        Manifest.layer_expert_piece_id(l, e)
+                        for l in range(layer + 1, hi)
+                        for e in self._spec_fired(l)
+                    ]
+                    if spec_pids:
+                        self.cache.prefetch(spec_pids, speculative=True)
 
             pcache = kv.get(layer)
             if isinstance(pcache, QuantizedKVCache):
@@ -386,7 +570,11 @@ class StreamingEngine:
                 pk, pv = pcache.state           # [1, kv_heads, prefix_len, hd]
                 ephem = KVCache()
                 ephem.state = (mx.repeat(pk, B, axis=0), mx.repeat(pv, B, axis=0))
-            h = slot(h, mask=mask, cache=ephem)
+
+            if is_moe:
+                h = self._moe_attn_and_mix(slot, layer, h, mask, ephem)
+            else:
+                h = slot(h, mask=mask, cache=ephem)
             mx.eval(h)
 
             # [B, kv_heads, prefix_len+d, ...]: arrays for fp16, triples for
@@ -413,4 +601,7 @@ class StreamingEngine:
 
     def close(self) -> None:
         """Shut down the cache's background prefetch worker."""
+        if self._trace_fh is not None:
+            self._trace_flush()
+            self._trace_fh.close()
         self.cache.close()

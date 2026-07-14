@@ -191,6 +191,24 @@ def test_warmer_missing_file_does_not_break_load(tmp_path):
     assert "w" in got and loads == ["a"]
 
 
+def test_stats_classify_pids_by_class():
+    # "expert" if "_expert_" in pid, "core" if pid endswith "_core", else "dense".
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=10**9)
+    cache.get("layer_000_core")
+    cache.get("layer_000_expert_3")
+    cache.get("layer_001")            # dense whole-layer piece
+    cache.get("layer_000_core")       # hit
+    cache.close()
+
+    stats = cache.stats()
+    assert stats["hits"] == {"dense": 0, "core": 1, "expert": 0}
+    assert stats["misses"] == {"dense": 1, "core": 1, "expert": 1}
+    assert stats["bytes_loaded"] == {"dense": one, "core": one, "expert": one}
+    # existing global counters keep working exactly as before, as sums of the classes
+    assert cache.hits == 1 and cache.misses == 3
+
+
 def test_warm_does_not_change_tracked_bytes(tmp_path):
     # The warmer reads into the OS page cache; it must NOT allocate mx arrays or
     # touch the byte-budget accounting (spec memory-bound invariant).
@@ -202,3 +220,291 @@ def test_warm_does_not_change_tracked_bytes(tmp_path):
     assert cache._bytes == 0
     assert cache.resident_ids == []
     cache.close()
+
+
+# ---- two-region policy (plan4 M2): MRU main region + LRU expert region ----
+
+def _E(i):
+    return f"layer_000_expert_{i}"
+
+
+def test_expert_region_evicts_lru_first():
+    # Expert region cap = 4*one * 0.625 = 2.5 pieces. Touch e1 again before
+    # loading e3: the least-recently-used expert (e2) must be the one evicted.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.625)
+    cache.get(_E(1))
+    cache.get(_E(2))
+    cache.get(_E(1))                  # hit -> e1 becomes most-recent
+    cache.get(_E(3))                  # over expert cap -> evict LRU (e2)
+    resident = set(cache.resident_ids)
+    cache.close()
+    assert resident == {_E(1), _E(3)}
+    assert loads.count(_E(1)) == 1    # e1 was a hit, never reloaded
+
+
+def test_dense_pressure_never_evicts_experts():
+    # frac=0.5: expert cap = 2*one, main cap = 2*one once the split is active.
+    # Filling the expert region, then hammering dense pieces, must only evict
+    # dense pieces (per the main region's MRU policy).
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5)
+    cache.get(_E(1))
+    cache.get(_E(2))
+    for pid in ("a", "b", "c", "d", "e"):
+        cache.get(pid)
+    resident = set(cache.resident_ids)
+    cache.close()
+    assert {_E(1), _E(2)} <= resident            # experts untouched
+    assert sum(p in resident for p in "abcde") == 2   # main capped at 2 pieces
+    assert loads.count(_E(1)) == 1 and loads.count(_E(2)) == 1
+
+
+def test_expert_pressure_never_evicts_dense():
+    # Dense pieces loaded before any expert stay resident (main cap = 2*one
+    # after the split activates, and a+b fit exactly); expert churn beyond the
+    # expert cap must evict only experts.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5)
+    cache.get("a")
+    cache.get("b")
+    for i in range(1, 6):
+        cache.get(_E(i))
+    resident = set(cache.resident_ids)
+    cache.close()
+    assert {"a", "b"} <= resident
+    experts = {p for p in resident if "_expert_" in p}
+    assert experts == {_E(4), _E(5)}             # LRU kept the 2 most recent
+    assert loads.count("a") == 1 and loads.count("b") == 1
+
+
+def test_stats_report_per_region_occupancy():
+    loader, _loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5)
+    cache.get("a")
+    cache.get(_E(1))
+    cache.get(_E(2))
+    stats = cache.stats()
+    cache.close()
+    assert stats["resident_bytes"] == {"main": one, "expert": 2 * one}
+
+
+def test_pinned_core_survives_both_regions_pressure():
+    # A pinned core piece must never be evicted, even when the split activates
+    # and shrinks the main region below what is resident.
+    loader, _loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5,
+                       pinned=["layer_000_core"])
+    cache.get("layer_000_core")
+    for pid in ("a", "b", "c"):
+        cache.get(pid)               # main at 4*one (full budget; split inactive)
+    for i in range(1, 5):
+        cache.get(_E(i))             # split activates: main cap -> 2*one
+    resident = set(cache.resident_ids)
+    cache.close()
+    assert "layer_000_core" in resident
+
+
+# ---- two-tier prefetch queue (plan4 M3b): demand beats speculative ----
+
+def test_demand_prefetch_drains_before_speculative():
+    # Occupy the single worker with a blocking load, enqueue speculative pids
+    # first and demand pids second, then release: the worker must materialize ALL
+    # demand pids before ANY speculative pid (tier beats FIFO seq order).
+    import threading
+    order = []
+    started = threading.Event()
+    gate = threading.Event()
+
+    def loader(pid):
+        if pid == "block":
+            started.set()
+            gate.wait()
+        order.append(pid)
+        return {"w": mx.zeros((2, 2))}
+
+    cache = PieceCache(loader, budget_bytes=10**9)
+    cache.prefetch(["block"])                       # seizes the worker
+    assert started.wait(1)
+    cache.prefetch([_E(1), _E(2), _E(3)], speculative=True)  # low tier, enqueued first
+    cache.prefetch(["d1", "d2"])                    # demand tier, enqueued after
+    gate.set()
+    cache.close()                                   # drains all queued, then stops
+
+    assert order[0] == "block"
+    demand_last = max(order.index("d1"), order.index("d2"))
+    spec_first = min(order.index(_E(1)), order.index(_E(2)), order.index(_E(3)))
+    assert demand_last < spec_first                 # every demand pid before any spec
+
+
+def test_speculative_dedup_and_used_counter():
+    loader, loads, _one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=10**9)
+    cache.prefetch([_E(1)], speculative=True)
+    cache.prefetch([_E(1)])                # already in flight -> deduped, not re-issued
+    cache.prefetch([_E(1)], speculative=True)  # dedup again
+    got = cache.get(_E(1))                 # hit (waits on the in-flight spec load) -> used
+    cache.close()
+
+    st = cache.stats()["speculative"]
+    assert st["issued"] == 1               # only the first reservation issued a load
+    assert st["used"] == 1                 # the get() hit the speculatively-loaded piece
+    assert st["wasted_bytes"] == 0
+    assert loads.count(_E(1)) == 1 and "w" in got   # materialized exactly once
+
+
+def _wait_staged(cache, pid):
+    for _ in range(2000):
+        if pid in cache._staging:
+            return
+        time.sleep(0.001)
+    raise AssertionError(f"{pid} never staged")
+
+
+def test_speculative_load_lands_in_staging_not_expert_lru():
+    # v3: speculative loads land in the STAGING buffer, never the expert LRU.
+    # Staging shares the expert budget (occupied staging squeezes the LRU tail so
+    # total bytes never grow past the expert share), so a blast far bigger than
+    # the region costs demand at most the staging cap — never the whole set.
+    # Expert share = 8*one*0.5 = 4*one; staging cap 1*one -> 3 demand experts
+    # must survive any blast.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 8, expert_frac=0.5,
+                       spec_staging_bytes=int(one))
+    cache.begin_pass()
+    for i in (1, 2, 3):                    # demand working set (3*one of 4*one share)
+        cache.get(_E(i))
+    for i in range(10, 20):                # speculative blast >> expert region
+        cache.prefetch([_E(i)], speculative=True)
+    cache.close()                          # drains all queued spec loads into staging
+
+    resident = set(cache.resident_ids)
+    assert {_E(1), _E(2), _E(3)} <= resident                  # demand experts survived
+    assert not any(_E(i) in resident for i in range(10, 20))  # no spec in the LRU
+    stats = cache.stats()
+    # expert LRU + staging never exceed the expert share despite the blast
+    assert stats["resident_bytes"]["expert"] + cache._staging_bytes <= 4 * one
+    assert cache._staging_bytes <= one                        # staging under its cap
+
+
+def test_staging_cap_drops_oldest_and_counts_wasted():
+    # Staging cap = 2*one -> holds 2 staged pieces; a 3rd drops the OLDEST staged
+    # entry (and counts its bytes wasted), never touching the resident regions.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5,
+                       spec_staging_bytes=int(one * 2))
+    cache.begin_pass()
+    for i in (1, 2, 3):
+        cache.prefetch([_E(i)], speculative=True)
+        _wait_staged(cache, _E(i))
+    staged = set(cache._staging)
+    cache.close()
+
+    assert staged == {_E(2), _E(3)}        # oldest (_E(1)) dropped to make room
+    st = cache.stats()["speculative"]
+    assert st["issued"] == 3
+    assert st["used"] == 0
+    assert st["wasted_bytes"] == one       # _E(1) dropped by cap pressure
+
+
+def test_staged_piece_demanded_migrates_to_expert_lru_as_demand():
+    # A demand get() on a staged piece counts used ONCE, moves it out of staging
+    # into the expert LRU, and from then on it behaves as a plain demand piece
+    # (a later plain hit does not re-count used; normal LRU eviction is not wasted).
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.625,  # expert cap 2
+                       spec_staging_bytes=int(one * 2))
+    cache.begin_pass()
+    cache.prefetch([_E(1)], speculative=True)
+    _wait_staged(cache, _E(1))
+    got = cache.get(_E(1))                 # staging hit -> used, migrate to expert LRU
+    assert "w" in got
+    assert _E(1) not in cache._staging
+    assert _E(1) in cache.resident_ids     # now a normal demand piece
+    st = cache.stats()["speculative"]
+    assert st["used"] == 1 and st["wasted_bytes"] == 0
+
+    cache.get(_E(1))                       # plain hit: used must NOT increment again
+    assert cache.stats()["speculative"]["used"] == 1
+
+    cache.get(_E(2))
+    cache.get(_E(3))                       # over expert cap -> LRU-evict _E(1) as demand
+    resident = set(cache.resident_ids)
+    cache.close()
+
+    assert _E(1) not in resident
+    assert cache.stats()["speculative"]["wasted_bytes"] == 0  # used, so never wasted
+    assert loads.count(_E(1)) == 1         # loaded exactly once
+
+
+def test_staged_piece_expires_after_one_pass_grace():
+    # A staged piece survives its insertion pass plus exactly one more (begin_pass
+    # grace); if still undemanded it is expired at begin_pass and counted wasted.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4, expert_frac=0.5,
+                       spec_staging_bytes=int(one * 4))
+    cache.begin_pass()                     # epoch 1
+    cache.prefetch([_E(1)], speculative=True)
+    _wait_staged(cache, _E(1))             # staged at epoch 1
+
+    cache.begin_pass()                     # epoch 2: within grace -> survives
+    assert _E(1) in cache._staging
+    assert cache.stats()["speculative"]["wasted_bytes"] == 0
+
+    cache.begin_pass()                     # epoch 3: past grace -> expired
+    assert _E(1) not in cache._staging
+    st = cache.stats()["speculative"]
+    cache.close()
+    assert st["used"] == 0
+    assert st["wasted_bytes"] == one       # never demanded within its window
+
+
+def test_demand_get_joining_inflight_speculative_load_counts_used():
+    # A demand get() that joins a still-in-flight speculative load (waits on the
+    # dedup Event) must count as `used` — the guess was right before the load
+    # even finished — and the piece lands as a normal hot demand piece (never
+    # later counted wasted).
+    import threading
+    started = threading.Event()
+    gate = threading.Event()
+
+    def loader(pid):
+        started.set()
+        gate.wait()
+        return {"w": mx.zeros((2, 2))}
+
+    cache = PieceCache(loader, budget_bytes=10**9)
+    cache.prefetch([_E(1)], speculative=True)
+    assert started.wait(1)                 # spec load is in flight (blocked)
+    got = {}
+    t = threading.Thread(target=lambda: got.setdefault("w", cache.get(_E(1))))
+    t.start()
+    for _ in range(2000):                  # used is counted at JOIN time,
+        if cache.speculative_used == 1:    # before the load materializes
+            break
+        time.sleep(0.001)
+    assert cache.speculative_used == 1
+    gate.set()
+    t.join(5)
+    cache.close()
+
+    st = cache.stats()["speculative"]
+    assert st["issued"] == 1 and st["used"] == 1 and st["wasted_bytes"] == 0
+    assert "w" in got["w"]                 # the joining get() got the weights
+    assert _E(1) in cache.resident_ids     # landed resident as a demand piece
+
+
+def test_split_inactive_dense_only_keeps_full_budget():
+    # With the DEFAULT expert_frac, a dense-only workload must still use the
+    # whole budget (the split only activates on the first expert insert) —
+    # dense models see zero behavior change from the two-region policy.
+    loader, loads, one = _arr_loader(0)
+    cache = PieceCache(loader, budget_bytes=one * 4)     # default expert_frac
+    for pid in ("a", "b", "c", "d"):
+        cache.get(pid)
+    for pid in ("a", "b", "c", "d"):
+        cache.get(pid)               # all hits: nothing was evicted
+    resident = set(cache.resident_ids)
+    cache.close()
+    assert resident == {"a", "b", "c", "d"}
+    assert len(loads) == 4

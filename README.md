@@ -1,18 +1,53 @@
 # NunSpark
 
-**Run oversized LLMs on Apple Silicon by streaming weights from disk, layer by layer.**
+**Run LLMs that don't fit in your Mac's RAM — at usable speeds.**
 
-NunSpark targets a simple, unglamorous problem: your Mac has 16 GB of unified memory and you
-want to run a model that needs 40+ GB of weights. Instead of refusing to load, NunSpark packs
-a model into one file per transformer layer ("piece"), and streams each piece from disk into a
-small resident budget just before it's needed, discarding it right after. Combined with
-disk-aware speculative decoding, this makes large (13–30B, 4-bit) models usable — a few tokens
-per second instead of not-at-all — on machines that could never hold the model in RAM.
+Your Mac has 16 GB of unified memory. The model you want needs 16–40 GB of weights. NunSpark
+runs it anyway: it packs the model into per-layer (and, for MoE models, per-*expert*) pieces
+on disk and streams exactly the weights each token needs through a small resident budget —
+then claws the speed back with three levers that only make sense in the disk-bound regime:
+
+- **MoE expert streaming** — a Qwen3-30B-A3B token fires only 8 of 128 experts per layer.
+  NunSpark loads *only those*, caches them expert-aware, and prefetches the ones the next
+  verify pass will probably fire. Measured on a 16 GB M4: **0.5 → 2.1 tok/s**, reading
+  ~100 MB/token instead of ~1 GB.
+- **Deep-K speculative decoding** — on disk-bound hardware the draft model's compute is free,
+  so speculation can go far deeper (K=16–24) than GPU serving ever would. One weight sweep
+  buys up to 7 accepted tokens. Lossless: output is bit-identical to running the target alone.
+- **Byte-budgeted streaming engine** — every forward pass verified bit-identical to full-load
+  mlx-lm, fp16 and 4-bit, across 24 registered architectures.
+
+**Measured on a 16 GB M4 MacBook Pro** (16–40 GB models that can't fully load, all lossless):
+
+| Model (4-bit) | Size on disk | tok/s | How |
+|---|---|---|---|
+| Qwen3-30B-A3B (MoE) | 16 GB | **1.5–2.1** | expert streaming + expert-aware cache |
+| Qwen3-30B-A3B (MoE) | 16 GB | **up to 1.54 speculative** | + deep-K spec (M≈7 on reasoning prompts) |
+| Qwen2.5-32B (dense) | 18 GB | **0.9–1.1** | streaming + deep-K spec |
+| Llama-3.3-70B (dense) | 40 GB | **~0.9** | streaming + deep-K spec |
+
+For scale: naive streaming (or `llama.cpp` mmap-thrashing) gives ~0.1–0.2 tok/s on the same
+hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality tradeoff —
+"lossless" means the streamed model produces exactly the tokens the full-RAM model would.
+
+**Try it in three commands** (needs an Apple Silicon Mac, `uv`, and ~35 GB of free disk —
+the HF download and the packed copy each take ~16 GB; the download cache can be deleted
+after packing):
+
+```bash
+uv venv --python 3.11 && uv sync
+uv run nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
+uv run nunspark generate ./packed/qwen3-30b --budget 8GB --max-tokens 200 --metrics \
+  --prompt "Explain how a B-tree stays balanced."
+```
+
+That's a 30-billion-parameter model generating on a machine that cannot hold it in memory.
+Add `--draft-model Qwen/Qwen3-0.6B --num-draft-tokens 24` for the speculative mode.
 
 > This is an experimental research project, not a production inference server. Read
-> [requirment.md](requirment.md) for the honest story of what worked and what didn't, and
-> [report.md](report.md) for measured benchmarks on a real 16 GB M4 (Qwen2.5-32B and
-> Llama-3.3-70B, 4-bit).
+> [requirment.md](requirment.md) for the honest story of what worked and what didn't,
+> [report.md](report.md) for the dense-model benchmarks, and
+> [docs/plan4-m3-gate-summary.md](docs/plan4-m3-gate-summary.md) for the MoE numbers above.
 
 ---
 
@@ -21,34 +56,43 @@ per second instead of not-at-all — on machines that could never hold the model
 The obvious approach — split a model into pieces and load only the weights you need — was
 tried first in its plain form and it *works*, but it's not competitive: naive weight-streaming
 gives roughly the same throughput as `llama.cpp`'s `mmap` (~0.1–0.2 tok/s for a 70B model on a
-16 GB M4). Streaming alone is not a moat.
+16 GB M4). Streaming alone is not a moat. Two findings changed that.
 
-The actual finding: in the **disk-bound regime**, speculative decoding's usual cost (extra
-compute for the draft model) is hidden behind the dominant cost of reading weights off disk.
-That means you can push speculation much deeper (larger K) than anyone tuning for GPU-bound
-serving would ever try, and each additional accepted draft token is nearly free — it saves a
-full weight-read pass instead of costing extra latency. Measured acceptance multipliers rose
-from ~2.5× to ~5× as K grew, while naive tok/s fell — opposite slopes, which is the signal
-that this regime rewards deep speculation differently than GPU serving does.
+### Finding 1: the disk-bound regime rewards *deep* speculation
 
-| Target (4-bit) | Naive stream | × M(~5) | × M(~3, conservative) |
-|-----------------|--------------|---------|------------------------|
-| 70B             | 0.08 tok/s   | 0.40    | 0.24 tok/s             |
-| 30B             | 0.17 tok/s   | 0.85    | 0.51 tok/s             |
-| 26B             | 0.20 tok/s   | 1.00    | 0.60 tok/s             |
+Speculative decoding's usual cost (extra compute for the draft model) is hidden behind the
+dominant cost of reading weights off disk. That means you can push speculation much deeper
+(larger K) than anyone tuning for GPU-bound serving would ever try, and each additional
+accepted draft token is nearly free — it saves a full weight-read pass instead of costing
+extra latency. Measured acceptance multipliers rose from ~2.5× to ~5× as K grew, while naive
+tok/s fell — opposite slopes, which is the signal that this regime rewards deep speculation
+differently than GPU serving does. And it's lossless: the target model verifies every draft
+token, so output is identical to running the target alone. See [requirment.md](requirment.md)
+for the full analysis and caveats (vocab lock-in between draft/target, etc). The dense-model
+benchmarks in [report.md](report.md) confirmed it, and added a second lesson:
+**draft–target agreement, not resident cache size, is the primary determinant of throughput.**
 
-Speculative decoding is lossless (identical output distribution to running the target alone),
-so this is a straight 3–5× speedup, not a quality tradeoff. See
-[requirment.md](requirment.md) 
-for the full analysis and caveats (vocab lock-in between draft/target, why the win concentrates
-in the 13–30B band rather than the hero 70B number, etc).
+### Finding 2: MoE models are the natural fit for streaming
 
-**Measured results** ([report.md](report.md)) confirm the thesis on a real 16 GB M4: a streamed
-Qwen2.5-32B-4bit reaches **~0.9–1.1 tok/s losslessly** (and ~2.6–2.8 tok/s in approximate
-top-k mode), and a streamed Llama-3.3-70B-4bit stays usable at **~0.9 tok/s** — both while
-keeping only ~1.1–1.4 GB of weights resident out of 18–40 GB models. The headline finding
-from those runs: **draft–target agreement, not resident cache size, is the primary determinant
-of throughput.**
+A dense model makes you read *every* weight for *every* token — streaming can only amortize
+that. A mixture-of-experts model already routes each token through a small slice of itself:
+Qwen3-30B-A3B fires 8 of 128 experts per layer, ~1 GB of expert weights per token out of a
+16 GB model. NunSpark packs each expert as its own piece and exploits that sparsity end to end:
+
+- **Load only fired experts.** The router runs first; only the 8 winners per layer are read.
+  This holds in the speculative tree-verify path too, which loads the fired *union* (measured
+  51–65% of experts at K=24) instead of all 128.
+- **Cache experts on their own terms.** Dense layers scan cyclically (MRU is right); experts
+  reuse sparsely (LRU is right). A two-region cache with per-layer cores pinned took the
+  expert hit rate from 57–64% to 89–92% at the same 8 GB budget — that alone was 0.5 → 1.3–2.1
+  tok/s.
+- **Prefetch the next verify pass's experts.** Consecutive verify passes fire 74–80%
+  overlapping expert sets. Predicted experts stream in a low-priority I/O tier into a staging
+  buffer that can never evict the live working set. Speculative decoding on top: up to
+  **1.54 tok/s lossless** on reasoning prompts (2.4× the no-prefetch control).
+
+Every one of those policies was chosen by measurement — the failed variants and their numbers
+are written up in [docs/](docs/) gate summaries.
 
 ## Design principles
 
@@ -66,9 +110,15 @@ of throughput.**
 - **Packer** (`nunspark pack`) — converts an mlx-lm-compatible model (local dir or HF repo) into
   per-layer safetensors pieces plus a JSON manifest. Supports 4-bit quantized weights
   (embedding + lm_head triplets included).
-- **Streaming engine** (`StreamingEngine`) — loads one piece at a time into a byte-budgeted LRU
-  cache (`PieceCache`) with a background prefetch worker that overlaps disk I/O with compute.
+- **Streaming engine** (`StreamingEngine`) — loads pieces into a byte-budgeted cache
+  (`PieceCache`) with a background prefetch pool that overlaps disk I/O with compute.
   Forward pass is verified bit-identical to full-load mlx-lm, fp16 and 4-bit alike.
+- **MoE expert streaming** — for MoE models (Qwen3-MoE, gpt-oss), the packer splits each layer
+  into a core piece (attention/norms/router) plus one piece per expert; the engine loads only
+  the experts the router fires. Two-region cache (MRU for the dense cyclic scan, LRU for
+  sparse expert reuse, cores pinned), fired-union selective loading in tree verify, and
+  temporal expert prefetch at verify-pass granularity into an eviction-safe staging buffer.
+  All bit-identical to loading every expert.
 - **Speculative decoding** — the core reason this is usable:
   - Standard draft-model speculative decoding (`--draft-model`, any mlx_lm-format model that
     shares a tokenizer with the target).
@@ -91,8 +141,7 @@ of throughput.**
   `nunspark.architectures.supported_model_types()`; `pack` will tell you if a model's
   `model_type` isn't supported. Multimodal models are not supported (text decoders only).
 
-Not built / deferred: MoE expert-streaming beyond the existing selective-expert loading;
-TurboQuant 2–4 bit KV (blocked on upstream MLX SDPA support).
+Not built / deferred: TurboQuant 2–4 bit KV (blocked on upstream MLX SDPA support).
 
 ## Requirements
 
@@ -168,31 +217,38 @@ Key flags:
 | `--accept-top-k` | `1` = lossless speculative decoding; `>1` = fast mode (bounded deviation from the target distribution). |
 | `--metrics` | Print tok/s, peak memory, cache hit/miss, and (if speculative) acceptance-multiplier stats after generation. |
 
-### The headline use case: a mid-tier model that doesn't fit in RAM
+### The headline use case: a 30B MoE model on a 16 GB Mac
 
-This is the reason the project exists — run a 4-bit ~30B model on 16 GB by streaming it, and
-recover usable throughput with a small draft model that shares the target's tokenizer:
+This is the configuration behind the numbers at the top — a 16 GB model on a 16 GB machine,
+streaming only the experts each token actually fires:
 
 ```bash
-# 1. Pack the oversized target once (weights live on disk as per-layer pieces).
+# 1. Pack the oversized target once. For MoE models this splits every layer into a
+#    core piece + one piece per expert (~6200 files for Qwen3-30B-A3B).
 uv run nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
 
-# 2. Stream it with speculative decoding. The draft (Qwen3-0.6B) shares Qwen3's
-#    tokenizer, so its proposals are valid target tokens. --budget caps resident
-#    weights well below the full model size; --num-draft-tokens is the "deep-K" lever.
+# 2. Stream it. Greedy decode alone reaches 1.5–2.1 tok/s at an 8 GB budget:
 uv run nunspark generate ./packed/qwen3-30b \
-  --prompt "Write a Python function that streams a large file line by line." \
+  --prompt "Explain how a B-tree stays balanced." \
+  --budget 8GB --max-tokens 256 --metrics
+
+# 3. Add deep-K speculation. The draft (Qwen3-0.6B) shares Qwen3's tokenizer, so its
+#    proposals are valid target tokens; one 30B verify sweep then buys up to ~7 tokens.
+uv run nunspark generate ./packed/qwen3-30b \
+  --prompt "Think step by step: a train leaves at 9:14 travelling 83 km/h ..." \
   --draft-model Qwen/Qwen3-0.6B \
-  --num-draft-tokens 16 \
+  --num-draft-tokens 24 \
   --accept-top-k 1 \
-  --budget 4GB \
-  --max-tokens 256 \
-  --metrics
+  --budget 8GB --max-tokens 256 --metrics
 ```
 
-With `--metrics` you'll see the acceptance multiplier and the effective-vs-naive tok/s — that
-multiplier (measured ~3–5× on easy prompts) is the whole finding. `--accept-top-k 1` keeps it
-lossless; raise it for "fast mode" if you'll accept bounded deviation.
+With `--metrics` you'll see the acceptance multiplier M and the effective tok/s. Which mode
+wins depends on the prompt: speculation shines where the draft agrees with the target
+(reasoning chains, prose — measured M up to 7.4 and 1.54 tok/s), while terse low-agreement
+prompts can be faster in plain greedy (2.1 tok/s on prose, 1.5 on code). `--accept-top-k 1`
+keeps it lossless; raise it for "fast mode" if you'll accept bounded deviation. The same two
+commands work for dense models (Qwen2.5-32B, Llama-3.3-70B) — speculation is the main lever
+there, since every token reads the full layer stack.
 
 For an end-to-end script that also downloads/converts the model, verifies streamed output
 against a full-load run, and can A/B linear vs tree speculation, see
