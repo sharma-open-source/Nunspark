@@ -1,6 +1,6 @@
 [project]
 name = "nunspark"
-version = "0.2.0"
+version = "0.4.0"
 description = "Run LLMs bigger than your Mac's RAM: disk-streamed weights, MoE expert streaming, and deep-K speculative decoding on Apple Silicon"
 readme = "README.md"
 license = { file = "LICENSE" }
