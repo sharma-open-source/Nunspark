@@ -30,14 +30,14 @@ For scale: naive streaming (or `llama.cpp` mmap-thrashing) gives ~0.1–0.2 tok/
 hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality tradeoff —
 "lossless" means the streamed model produces exactly the tokens the full-RAM model would.
 
-**Try it in three commands** (needs an Apple Silicon Mac, `uv`, and ~35 GB of free disk —
-the HF download and the packed copy each take ~16 GB; the download cache can be deleted
-after packing):
+**Try it in three commands** (needs an Apple Silicon Mac, Python 3.11+, and ~35 GB of free
+disk — the HF download and the packed copy each take ~16 GB; the download cache can be
+deleted after packing):
 
 ```bash
-uv venv --python 3.11 && uv sync
-uv run nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
-uv run nunspark generate ./packed/qwen3-30b --budget 8GB --max-tokens 200 --metrics \
+pip install nunspark
+nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
+nunspark generate ./packed/qwen3-30b --budget 8GB --max-tokens 200 --metrics \
   --prompt "Explain how a B-tree stays balanced."
 ```
 
@@ -159,6 +159,24 @@ Not built / deferred: TurboQuant 2–4 bit KV (blocked on upstream MLX SDPA supp
   pass `--python 3.11`.
 
 ## Installation
+
+### From PyPI
+
+```bash
+pip install nunspark            # or: uv pip install nunspark
+```
+
+That's the whole install — you get the `nunspark` CLI (`pack` / `generate` / `serve` / `web`)
+and the Python API. Requires Python 3.11+ on an Apple Silicon Mac (the `mlx` dependency has
+no wheels for other platforms, so installation fails anywhere else by design).
+
+For the web UI, add the `web` extra:
+
+```bash
+pip install "nunspark[web]"
+```
+
+### From source
 
 ```bash
 git clone <this-repo>
