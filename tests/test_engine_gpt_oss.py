@@ -13,12 +13,22 @@ _NUM_LOCAL_EXPERTS = 8  # mirrors conftest.TINY_GPT_OSS_CONFIG["num_local_expert
 
 
 def _reference_logits(model_dir, tokens):
-    """Full-load the GPT-OSS model the way mlx-lm would, and run it."""
+    """Full-load the GPT-OSS model the way mlx-lm would, and run it. Honors a
+    heterogeneous quantization dict (per-path override dicts over a scalar base)
+    via the same class_predicate contract mlx_lm.load_model uses, so it is a valid
+    reference for both uniform and mixed-quant checkpoints."""
     config = json.loads((model_dir / "config.json").read_text())
     model = Model(ModelArgs.from_dict(config))
     q = config.get("quantization")
     if q:
-        nn.quantize(model, group_size=q["group_size"], bits=q["bits"])
+        def class_predicate(path, module):
+            if path in q:
+                return q[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            return True
+        nn.quantize(model, group_size=q["group_size"], bits=q["bits"],
+                    mode=q.get("mode", "affine"), class_predicate=class_predicate)
     weights = mx.load(str(model_dir / "model.safetensors"))
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())
@@ -69,6 +79,47 @@ def test_gpt_oss_quant_forward_matches_full_load(tiny_gpt_oss_quant_model_dir, t
         got = engine.forward(mx.array(tokens)[None])
         mx.eval(got)
         # quantized matmuls are deterministic -> streamed output is bit-identical
+        assert float(mx.max(mx.abs(got - ref))) == 0.0
+    finally:
+        engine.close()
+
+
+def test_gpt_oss_mixed_quant_forward_matches_full_load(
+        tiny_gpt_oss_mixed_quant_model_dir, tmp_path):
+    # Heterogeneous checkpoint (mxfp4 experts + 8-bit-affine attn/router/embed/head).
+    # The engine must build each module from its OWN resolved config, incl. mode;
+    # experts have no quant biases while attention does. Bit-identical to full-load.
+    out = tmp_path / "gpt-oss-mixed.nunspark"
+    pack(tiny_gpt_oss_mixed_quant_model_dir, out)
+    manifest = Manifest.load(out / "manifest.json")
+    assert manifest.has_piece(Manifest.layer_core_piece_id(0))   # selective pack
+
+    tokens = [3, 7, 42, 1, 9, 15]
+    ref = _reference_logits(tiny_gpt_oss_mixed_quant_model_dir, tokens)
+    engine = StreamingEngine(out, manifest, budget_bytes=10**9)
+    try:
+        got = engine.forward(mx.array(tokens)[None])
+        mx.eval(got)
+        assert got.shape == ref.shape
+        # quantized matmuls are deterministic -> streamed output is bit-identical
+        assert float(mx.max(mx.abs(got - ref))) == 0.0
+    finally:
+        engine.close()
+
+
+def test_gpt_oss_mixed_quant_tiny_budget(tiny_gpt_oss_mixed_quant_model_dir, tmp_path):
+    # Same mixed checkpoint under a budget too small to keep any expert piece
+    # resident: scatter-then-discard must still be bit-identical.
+    out = tmp_path / "gpt-oss-mixed.nunspark"
+    pack(tiny_gpt_oss_mixed_quant_model_dir, out)
+    manifest = Manifest.load(out / "manifest.json")
+
+    tokens = [3, 7, 42, 1, 9, 15]
+    ref = _reference_logits(tiny_gpt_oss_mixed_quant_model_dir, tokens)
+    engine = StreamingEngine(out, manifest, budget_bytes=1)
+    try:
+        got = engine.forward(mx.array(tokens)[None])
+        mx.eval(got)
         assert float(mx.max(mx.abs(got - ref))) == 0.0
     finally:
         engine.close()

@@ -18,6 +18,41 @@ from .piece_store import PieceStore
 from .piece_cache import PieceCache
 
 
+def _quant_base_config(quant: dict | None) -> dict | None:
+    """The top-level (base) quantization config: the scalar entries that apply
+    to every module without an explicit per-path override. None for fp16 models.
+
+    Only the kwargs mx quantization accepts (group_size/bits/mode) are kept — the
+    same dict is a config that mixed checkpoints (gpt-oss) carry alongside their
+    per-module override dicts — so it can be splatted straight into to_quantized /
+    QuantizedLinear / QuantizedEmbedding."""
+    if not quant:
+        return None
+    return {k: quant[k] for k in ("group_size", "bits", "mode")
+            if k in quant and not isinstance(quant[k], dict)}
+
+
+def _resolve_module_quant(quant: dict | None, base: dict | None, full_path: str):
+    """Resolve one module's quantization config from the full quantization dict,
+    keyed by the module's FULL model path (e.g. ``model.layers.3.self_attn.q_proj``,
+    ``model.embed_tokens``, ``lm_head``).
+
+    Mirrors mlx_lm.utils.load_model's per-path class_predicate: an explicit
+    per-path entry wins (a config dict -> quantize with it; ``False`` -> leave the
+    module unquantized, e.g. the bf16 non-expert weights of an ``mxfp4-bf16``
+    checkpoint); every other path falls back to the top-level ``base`` config.
+    For a uniformly-quantized checkpoint (no dict-valued overrides) every path
+    misses and resolves to ``base`` — i.e. exactly the pre-mixed-quant behavior.
+
+    Returns a splat-ready config dict, or None when the module is unquantized."""
+    if not quant:
+        return None
+    entry = quant.get(full_path)
+    if entry is not None:
+        return entry if isinstance(entry, dict) else None   # dict -> use it; False -> unquantized
+    return base
+
+
 def _default_moe_route(args, gate_logits):
     """qwen3_moe-style routing: softmax over all logits, then top-k by score,
     then optional re-normalization of the selected scores. Returns (indices, scores)."""
@@ -151,7 +186,11 @@ class StreamingEngine:
         self._mask_plan = spec.mask_plan(self.args) if spec.mask_plan else UniformCausal()
         self.cache_kinds = spec.cache_plan(self.args) if spec.cache_plan else None
         self._runner = spec.layer_runner
-        self._quant_predicate = (
+        # The architecture's own class_predicate (gemma4 routes/mlp at 8-bit),
+        # used as the fallback for module paths the checkpoint's quantization dict
+        # doesn't override explicitly — so uniformly-packed archs keep their
+        # existing per-module quant choices bit-for-bit.
+        self._arch_quant_predicate = (
             spec.quant_predicate(self.args) if spec.quant_predicate else None
         )
         kv_sharing = spec.kv_sharing(self.args) if spec.kv_sharing else None
@@ -182,15 +221,26 @@ class StreamingEngine:
         self._trace_buf: list[str] = []
         self._trace_t = 0
 
-        quant = manifest.config.get("quantization")  # None for fp16 models
+        # quant is None for fp16 models. For quantized checkpoints it is the full
+        # quantization dict: top-level scalar base config (group_size/bits/mode)
+        # PLUS, for mixed-quant checkpoints (all mlx-community gpt-oss), a
+        # per-module-path override dict for each non-base module (e.g. gpt-oss keeps
+        # its MoE experts at the mxfp4 base but overrides embed_tokens / attention /
+        # router / lm_head to 8-bit affine). Every module below is built from ITS
+        # OWN resolved config via _module_quant, so a heterogeneous checkpoint no
+        # longer forces one uniform config onto every module.
+        quant = manifest.config.get("quantization")
         self._quant = quant
+        self._base_quant = _quant_base_config(quant)
 
         # --- embed (hot-set resident) ---
         embed_piece = self.store.load("embed")  # keys: embed_tokens.{weight[,scales,biases]}
-        if quant:
+        embed_cfg = self._module_quant("model.embed_tokens")
+        if embed_cfg is not None:
             self._embed = nn.QuantizedEmbedding(
                 self.args.vocab_size, self.args.hidden_size,
-                group_size=quant["group_size"], bits=quant["bits"],
+                group_size=embed_cfg["group_size"], bits=embed_cfg["bits"],
+                mode=embed_cfg.get("mode", "affine"),
             )
         else:
             self._embed = nn.Embedding(self.args.vocab_size, self.args.hidden_size)
@@ -209,15 +259,18 @@ class StreamingEngine:
         # --- output head (callable: logits = self._head(h)) ---
         if manifest.tie_word_embeddings:
             # as_linear does h @ weightᵀ for nn.Embedding and the quantized
-            # matmul for nn.QuantizedEmbedding, so this covers both fp16 and 4-bit.
+            # matmul for nn.QuantizedEmbedding, so this covers fp16 and every
+            # quantization mode (its config comes from the tied embed above).
             self._head = self._embed.as_linear
         else:
             head = {k[len("lm_head."):]: v for k, v in norm_head.items()
                     if k.startswith("lm_head.")}
-            if quant:
+            head_cfg = self._module_quant("lm_head")
+            if head_cfg is not None:
                 lm_head = nn.QuantizedLinear(
                     self.args.hidden_size, self.args.vocab_size, bias=False,
-                    group_size=quant["group_size"], bits=quant["bits"],
+                    group_size=head_cfg["group_size"], bits=head_cfg["bits"],
+                    mode=head_cfg.get("mode", "affine"),
                 )
             else:
                 lm_head = nn.Linear(self.args.hidden_size, self.args.vocab_size, bias=False)
@@ -231,16 +284,56 @@ class StreamingEngine:
         self._slot_key: object = object()  # sentinel — never matches a real key
         self._slot = self._make_slot(0)
 
+    def _module_quant(self, full_path: str):
+        """Resolve a single module's quant config (dict or None) from the full
+        checkpoint quantization dict, keyed by its FULL model path."""
+        return _resolve_module_quant(self._quant, self._base_quant, full_path)
+
+    def _slot_class_predicate(self, layer_idx: int):
+        """class_predicate for nn.quantize over one layer's compute slot.
+
+        nn.quantize hands us each leaf module's slot-relative path (e.g.
+        ``self_attn.q_proj``, ``mlp.experts.gate_proj``); we prefix it with this
+        layer's full model path and resolve the module's own config from the
+        quantization dict (base config + per-path overrides). An explicit override
+        wins (dict -> quantize with it, incl. its ``mode``; ``False`` -> skip);
+        otherwise, for paths the checkpoint doesn't name we defer to the arch's own
+        predicate (gemma4) if any, else fall back to the base config. Returning a
+        splat-ready dict lets a mixed checkpoint build, in one slot, mxfp4 experts
+        alongside 8-bit-affine attention/router — each with its own group_size/mode."""
+        prefix = f"model.layers.{layer_idx}."
+        quant = self._quant
+        base = self._base_quant
+        arch_pred = self._arch_quant_predicate
+
+        def predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            entry = quant.get(prefix + path)
+            if entry is not None:
+                return entry                     # dict -> quantize with it; False -> skip
+            if arch_pred is not None:
+                return arch_pred(path, module)   # gemma4's per-module choices
+            return base
+        return predicate
+
     def _make_slot(self, layer_idx: int) -> nn.Module:
-        """Build and optionally quantize a fresh compute slot for layer_idx."""
+        """Build and (per-module) quantize a fresh compute slot for layer_idx.
+
+        Each Linear/expert-Switch is quantized with its own resolved config, so a
+        mixed-quant checkpoint (mxfp4 experts + 8-bit-affine attention/router) is
+        built correctly; a uniformly-quantized checkpoint resolves every module to
+        the base config, unchanged from before."""
         slot = self._block_factory(self.args, layer_idx)
         if self._quant:
-            nn.quantize(
-                slot,
-                group_size=self._quant["group_size"],
-                bits=self._quant["bits"],
-                class_predicate=self._quant_predicate,
+            kwargs = dict(
+                group_size=self._base_quant["group_size"],
+                bits=self._base_quant["bits"],
+                class_predicate=self._slot_class_predicate(layer_idx),
             )
+            if "mode" in self._base_quant:      # e.g. gpt-oss base is mxfp4
+                kwargs["mode"] = self._base_quant["mode"]
+            nn.quantize(slot, **kwargs)
         return slot
 
     def _get_slot(self, layer_idx: int) -> nn.Module:
