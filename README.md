@@ -297,6 +297,25 @@ becomes one generation job; output streams to `<output_dir>/<name>.out.txt` with
 `.meta.json` sidecar, and progress is pushed live over SSE. This is built for long
 document-batch jobs, not interactive chat — the engine runs seconds-per-token.
 
+## Community benchmark
+
+```bash
+uv run nunspark bench
+```
+
+One command: on first run it packs the reference model (`mlx-community/Qwen3-30B-A3B-4bit`)
+into `./packed/` if it isn't already there (~35 GB disk — the download plus the packed
+copy — and asks for confirmation unless you pass `--yes`), then runs the three-workload
+suite (code / prose / reasoning) greedy and speculative, and prints your machine's chip,
+RAM, macOS/nunspark/mlx versions, and a tok/s + acceptance-multiplier + peak-memory table.
+Use `--quick` for a fast single-workload greedy-only smoke run, or `--no-spec` to skip the
+speculative passes. Pass any local packed dir, local model dir, or other HF repo id as the
+positional `model` argument to benchmark something other than the default.
+
+The report prints as a GitHub-markdown block between `BEGIN`/`END SHAREABLE REPORT`
+delimiters — copy it into a GitHub issue or discussion on this repo so results across
+machines are comparable.
+
 ## Development
 
 ```bash

@@ -128,6 +128,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--host", default="127.0.0.1")
     p_web.add_argument("--port", type=int, default=8000)
 
+    p_bench = sub.add_parser(
+        "bench", help="benchmark NunSpark on this machine and print a shareable report")
+    p_bench.add_argument("model", nargs="?", default="mlx-community/Qwen3-30B-A3B-4bit",
+                         help="HF repo id, local model dir, or already-packed dir "
+                              "(default: mlx-community/Qwen3-30B-A3B-4bit)")
+    p_bench.add_argument("--packed-root", default="./packed",
+                         help="directory auto-packed models are written under "
+                              "(default: ./packed)")
+    p_bench.add_argument("--draft", default="Qwen/Qwen3-0.6B",
+                         help="draft model for speculative runs (default: Qwen/Qwen3-0.6B)")
+    p_bench.add_argument("--no-spec", action="store_true",
+                         help="skip speculative runs entirely (greedy only)")
+    p_bench.add_argument("--draft-tokens", type=int, default=24)
+    p_bench.add_argument("--budget", default="8GB",
+                         help="PieceCache byte budget, e.g. 512MB, 8GB (default 8GB)")
+    p_bench.add_argument("--max-tokens", type=int, default=100)
+    p_bench.add_argument("--out", default=None, help="optional path to write raw JSON results")
+    p_bench.add_argument("--quick", action="store_true",
+                         help="fast smoke run: single prose workload, greedy only, 50 tokens")
+    p_bench.add_argument("--yes", action="store_true",
+                         help="skip the confirmation prompt before packing an HF repo")
+
     return parser
 
 
@@ -459,6 +481,61 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
+        return 0
+
+    if args.command == "bench":
+        from .bench import run_bench, system_info, format_report
+
+        model_arg = args.model
+        model_path = Path(model_arg)
+        default_model = "mlx-community/Qwen3-30B-A3B-4bit"
+
+        # Already a packed dir (local path carrying a manifest.json)?
+        if model_path.exists() and (model_path / "manifest.json").exists():
+            packed_dir = model_path
+        else:
+            # Local model dir or HF repo id -- pack it under --packed-root,
+            # named after the model id/dir, unless already packed there.
+            dir_name = model_path.name if model_path.exists() else model_arg.replace("/", "__")
+            packed_dir = Path(args.packed_root) / dir_name
+            if (packed_dir / "manifest.json").exists():
+                print(f"using existing packed model at {packed_dir}", file=sys.stderr)
+            else:
+                if model_arg == default_model and not args.yes:
+                    resp = input(
+                        f"This will download {default_model} (~16 GB) and write a packed "
+                        f"copy to {packed_dir} (~16 GB more, ~35 GB total). Continue? [y/N] ")
+                    if resp.strip().lower() not in ("y", "yes"):
+                        print("aborted", file=sys.stderr)
+                        return 1
+                print(f"packing {model_arg} -> {packed_dir} ...", file=sys.stderr)
+                pack_model(model_arg, packed_dir)
+
+        draft = None if args.no_spec else args.draft
+        if args.quick:
+            workloads = ["prose"]
+            max_tokens = 50
+            draft = None    # --quick is a greedy-only smoke run (matches the help text)
+        else:
+            workloads = None
+            max_tokens = args.max_tokens
+
+        out_path = Path(args.out) if args.out else None
+        results = run_bench(
+            packed_dir, draft=draft, draft_tokens=args.draft_tokens,
+            budget=_parse_size(args.budget), max_tokens=max_tokens,
+            workloads=workloads, out=out_path,
+        )
+
+        info = system_info()
+        report = format_report(info, results, model_arg)
+        print("\n----- BEGIN SHAREABLE REPORT -----")
+        print(report)
+        print("----- END SHAREABLE REPORT -----\n")
+        # stdout, not stderr: stderr is unbuffered and jumps ahead of the report
+        # when output is piped, putting this line before the run it refers to.
+        print("Share your results: paste the block above into a NunSpark GitHub "
+              "issue or discussion -- it helps calibrate expectations across machines.")
         return 0
 
     if args.command == "web":
