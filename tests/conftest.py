@@ -343,3 +343,54 @@ def tiny_gpt_oss_quant_model_dir(tmp_path) -> Path:
     flat = dict(tree_flatten(model.parameters()))
     mx.save_safetensors(str(out / "model.safetensors"), flat)
     return out
+
+
+def _gpt_oss_mixed_quant_dict() -> dict:
+    """The heterogeneous quantization dict of an mlx-community gpt-oss checkpoint,
+    at tiny scale: mxfp4 base (the MoE experts) plus per-path affine overrides for
+    embed_tokens / lm_head / every attention proj / every router — exactly the
+    shape (dict-valued per-module overrides over a scalar base) that mixed-quant
+    gpt-oss ships and that the streaming engine must resolve per module."""
+    ov = {"group_size": 64, "bits": 8, "mode": "affine"}
+    qd: dict = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    qd["model.embed_tokens"] = dict(ov)
+    qd["lm_head"] = dict(ov)
+    for l in range(TINY_GPT_OSS_CONFIG["num_hidden_layers"]):
+        for p in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            qd[f"model.layers.{l}.self_attn.{p}"] = dict(ov)
+        qd[f"model.layers.{l}.mlp.router"] = {"group_size": 64, "bits": 8}
+    return qd
+
+
+@pytest.fixture
+def tiny_gpt_oss_mixed_quant_model_dir(tmp_path) -> Path:
+    """A MIXED-quantization tiny GPT-OSS: mxfp4 experts + 8-bit-affine everything
+    else, quantized via a per-path class_predicate exactly as mlx_lm.load_model
+    would. Reproduces the real gpt-oss layout (experts carry weight/scales but NO
+    quant biases; attention/router carry weight/scales/biases). hidden=64 and
+    intermediate=64 divide both group sizes, so every weight round-trips exactly."""
+    mx.random.seed(0)
+    model = GptOssModel(GptOssModelArgs.from_dict(TINY_GPT_OSS_CONFIG))
+    mx.eval(model.parameters())
+
+    qd = _gpt_oss_mixed_quant_dict()
+
+    def class_predicate(path, module):
+        if path in qd:
+            return qd[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        return True   # unlisted paths (the experts) -> mxfp4 base
+
+    nn.quantize(model, group_size=32, bits=4, mode="mxfp4",
+                class_predicate=class_predicate)
+    mx.eval(model.parameters())
+
+    out = tmp_path / "tiny-gpt-oss-mixed"
+    out.mkdir()
+    config = {**TINY_GPT_OSS_CONFIG, "quantization": qd}
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+
+    flat = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(out / "model.safetensors"), flat)
+    return out

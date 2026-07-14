@@ -10,6 +10,5 @@ build/
 .nunspark_*/
 .claude
 .ruff_cache
-docs/*
 packed
 scripts/results
