@@ -99,6 +99,26 @@ def _pack_moe_layer(out_dir: Path, layer: int, layer_weights: dict, expert_prefi
         pieces.append(Piece(epid, efname, sorted(expert_weights)))
 
 
+def _load_lazy_flat(model_dir: str | Path) -> dict:
+    """Flat {key: mx.array} for a local dir or HF repo WITHOUT materializing.
+
+    ``mlx_lm.load(..., lazy=True)`` goes through the stock load path (download,
+    sanitize, quantization wrapping) but skips the final
+    ``mx.eval(model.parameters())``, so every array stays an unevaluated
+    mmap-backed load node. Materialization then happens piece-by-piece inside
+    ``pack()``, which frees each layer after writing it — peak memory is one
+    layer, not the whole model. Loading eagerly OOM-kills the process for any
+    model larger than RAM (observed: gpt-oss-120b, 59 GB on a 16 GB machine).
+    """
+    print(f"Loading {model_dir} (lazy) ...", file=sys.stderr, flush=True)
+    from mlx_lm import load as load_mlxlm
+    model, _tokenizer = load_mlxlm(str(model_dir), lazy=True)
+    weights = dict(tree_flatten(model.parameters()))
+    print(f"  packing {len(weights)} tensors", file=sys.stderr, flush=True)
+    del model  # weights dict keeps the (lazy) arrays alive; drop the module tree
+    return weights
+
+
 def pack(
     model_dir: str | Path | None,
     out_dir: str | Path,
@@ -145,21 +165,11 @@ def pack(
                 weights = mx.load(str(model_path / "model.safetensors"))
             except Exception:
                 # Fall back to mlx_lm.load() for sharded or complex formats
-                print(f"Loading {model_dir} ...", file=sys.stderr, flush=True)
-                from mlx_lm import load as load_mlxlm
-                model, _tokenizer = load_mlxlm(model_dir)
-                print(f"  packing {len(dict(tree_flatten(model.parameters())))} in-memory tensors",
-                      file=sys.stderr, flush=True)
-                weights = dict(tree_flatten(model.parameters()))
+                weights = _load_lazy_flat(model_dir)
         else:
             # HF repo: use mlx_lm.load() which handles download + loading
             config = _resolve_config(model_dir)
-            print(f"Loading {model_dir} ...", file=sys.stderr, flush=True)
-            from mlx_lm import load as load_mlxlm
-            model, _tokenizer = load_mlxlm(model_dir)
-            print(f"  packing {len(dict(tree_flatten(model.parameters())))} in-memory tensors",
-                  file=sys.stderr, flush=True)
-            weights = dict(tree_flatten(model.parameters()))
+            weights = _load_lazy_flat(model_dir)
 
     # Handle gemma4's language_model.model.* prefix (multimodal wrapper)
     # Normalize weights: language_model.model.* -> model.*
@@ -220,6 +230,10 @@ def pack(
 
     pieces: list[Piece] = []
 
+    # Shallow copy: pack() drops each layer's entries after writing its pieces
+    # so lazily-loaded tensors free as it goes; don't mutate the caller's dict.
+    weights = dict(weights)
+
     # embed piece — grabs embed_tokens.weight plus .scales/.biases if quantized
     embed = _collect(weights, _EMBED_PREFIX, "model.")
     mx.save_safetensors(str(out_dir / "embed.safetensors"), embed)
@@ -227,6 +241,7 @@ def pack(
 
     # per-layer pieces
     for layer in range(num_layers):
+        layer_keys = []
         layer_weights = {}
         for key, arr in weights.items():
             if not key.startswith(_LAYER_PREFIX):
@@ -234,6 +249,7 @@ def pack(
             idx, sub = _strip_layer_prefix(key)
             if idx == layer:
                 layer_weights[sub] = arr
+                layer_keys.append(key)
 
         is_moe = layer_key_fn is not None and layer_key_fn(arch_args, layer) == "moe"
         if is_moe:
@@ -243,6 +259,14 @@ def pack(
             fname = f"{pid}.safetensors"
             mx.save_safetensors(str(out_dir / fname), layer_weights)
             pieces.append(Piece(pid, fname, sorted(layer_weights)))
+
+        # Free this layer: saving evaluated the lazy arrays; dropping the refs
+        # and clearing MLX's buffer cache returns the memory to the OS, keeping
+        # peak usage at ~one layer for models far larger than RAM.
+        for key in layer_keys:
+            del weights[key]
+        del layer_weights
+        mx.clear_cache()
 
     # norm + (optional) head piece — both grab .scales/.biases if quantized
     norm_head = _collect(weights, _NORM_PREFIX, "model.")
