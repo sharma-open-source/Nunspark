@@ -25,10 +25,23 @@ then claws the speed back with three levers that only make sense in the disk-bou
 | Qwen3-30B-A3B (MoE) | 16 GB | **up to 1.54 speculative** | + deep-K spec (M≈7 on reasoning prompts) |
 | Qwen2.5-32B (dense) | 18 GB | **0.9–1.1** | streaming + deep-K spec |
 | Llama-3.3-70B (dense) | 40 GB | **~0.9** | streaming + deep-K spec |
+| gpt-oss-120b (117B MoE, 59 GB packed) | 64 GB | **1.65–1.96 greedy** | community-verified (M1 Max, 64 GB, v0.5.0) |
+| gpt-oss-120b (117B MoE, 59 GB packed) | 16 GB | 0.11–0.14 (correctness floor) | expert streaming, capacity-bound not defect-bound |
 
 For scale: naive streaming (or `llama.cpp` mmap-thrashing) gives ~0.1–0.2 tok/s on the same
 hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality tradeoff —
 "lossless" means the streamed model produces exactly the tokens the full-RAM model would.
+
+### Which model for your RAM
+
+- **16 GB** → `Qwen3-30B-A3B-4bit` with `--budget 8GB` (1.3–2.1 tok/s greedy, up to 1.54
+  speculative).
+- **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit` with
+  `--budget 48GB` (community: 4.57 tok/s spec vs 3.39 tok/s greedy on code).
+- **64 GB+** → `gpt-oss-120b-4bit` with `--budget 58GB` (1.65–1.96 tok/s greedy).
+
+The 70B and 120B numbers above are community-verified (M1 Max, 64 GB, v0.5.0) — see
+[docs/community-results.md](docs/community-results.md) for the full shareable reports.
 
 **Try it in three commands** (needs an Apple Silicon Mac, Python 3.11+, and ~35 GB of free
 disk — the HF download and the packed copy each take ~16 GB; the download cache can be
@@ -46,8 +59,11 @@ Add `--draft-model Qwen/Qwen3-0.6B --num-draft-tokens 24` for the speculative mo
 
 > This is an experimental research project, not a production inference server. Read
 > [requirment.md](requirment.md) for the honest story of what worked and what didn't,
-> [report.md](report.md) for the dense-model benchmarks, and
-> [docs/plan4-m3-gate-summary.md](docs/plan4-m3-gate-summary.md) for the MoE numbers above.
+> [report.md](report.md) for the dense-model benchmarks,
+> [docs/plan4-m3-gate-summary.md](docs/plan4-m3-gate-summary.md) for the MoE numbers above,
+> [docs/plan4-m5-gate-summary.md](docs/plan4-m5-gate-summary.md) for the gpt-oss-120b gate, and
+> [docs/community-results.md](docs/community-results.md) for shareable `nunspark bench` reports
+> from real machines other than the maintainer's.
 
 ---
 
@@ -231,6 +247,8 @@ Key flags:
 | `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations)). |
 | `--draft-model <path>` | Enable speculative decoding against a smaller draft model (must share a tokenizer with the target). |
 | `--eagle-drafter <path>` | Use a trained EAGLE feature-level drafter instead of a full draft model. |
+| `--ngram-draft` | Model-free prompt-lookup speculative decoding: drafts `--num-draft-tokens` tokens from the most recent prior occurrence of the context suffix. Zero draft-model cost, tokenizer-exact, lossless. Mutually exclusive with `--draft-model`/`--eagle-drafter`. |
+| `--ngram-max` | Longest suffix n-gram tried by `--ngram-draft` (default 3). |
 | `--num-draft-tokens` | Draft tokens proposed per speculative sweep (default 16 — the "deep-K" lever described above). |
 | `--accept-top-k` | `1` = lossless speculative decoding; `>1` = fast mode (bounded deviation from the target distribution). |
 | `--metrics` | Print tok/s, peak memory, cache hit/miss, and (if speculative) acceptance-multiplier stats after generation. |
@@ -267,6 +285,32 @@ prompts can be faster in plain greedy (2.1 tok/s on prose, 1.5 on code). `--acce
 keeps it lossless; raise it for "fast mode" if you'll accept bounded deviation. The same two
 commands work for dense models (Qwen2.5-32B, Llama-3.3-70B) — speculation is the main lever
 there, since every token reads the full layer stack.
+
+**For sparse MoE targets, speculative decoding measures *slower* than greedy** — a K-token
+verify pass fires each position's own experts with low cross-token overlap, so expert-union
+I/O grows with K while acceptance doesn't. Use greedy for MoE (Qwen3-30B-A3B, gpt-oss); use
+speculative decoding for dense targets. Full measurement and root cause:
+[docs/plan4-m5-gate-summary.md](docs/plan4-m5-gate-summary.md).
+
+### 64 GB+: gpt-oss-120b, the largest MoE target
+
+Same shape, bigger model. The packer streams the source weights lazily, so packing only needs
+~1.7 GB RAM even though the source download is ~63 GB and the packed output is ~59 GB — 16 GB
+machines can pack it, just not run it fast (see the "correctness floor" row above):
+
+```bash
+# 1. Pack. Needs ~63 GB free for the HF download + ~59 GB for the packed copy.
+uv run nunspark pack mlx-community/gpt-oss-120b-4bit ./packed/gpt-oss-120b
+
+# 2. Generate greedy, budget sized to your RAM (64 GB machine shown):
+uv run nunspark generate ./packed/gpt-oss-120b \
+  --prompt "Explain how a B-tree stays balanced." \
+  --budget 58GB --max-tokens 256 --metrics
+```
+
+Community-verified (M1 Max, 64 GB, v0.5.0): 1.65–1.96 tok/s greedy at `--budget 58GB`. See
+[docs/community-results.md](docs/community-results.md) for the full per-workload table and
+[docs/plan4-m5-gate-summary.md](docs/plan4-m5-gate-summary.md) for the M5 gate writeup.
 
 For an end-to-end script that also downloads/converts the model, verifies streamed output
 against a full-load run, and can A/B linear vs tree speculation, see

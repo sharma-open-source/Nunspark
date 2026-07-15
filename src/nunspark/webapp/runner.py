@@ -130,10 +130,6 @@ def run_generation(
                 kv_quant=kv_quant,
             )
 
-            # Replace with stack.callback(...) if EnginePool
-            # does not provide a context manager.
-            stack.callback(pool.release, handle)
-
             engine = handle.engine
             tokenizer = handle.tokenizer
             draft_model = handle.draft_model
@@ -154,6 +150,8 @@ def run_generation(
                 prompt = tokenizer.encode(prompt)
 
             eos = getattr(tokenizer, "eos_token_id", None)
+
+            cache_baseline = _cache_snapshot(engine)
 
             kv = KVStore(
                 kv_tmp,
@@ -235,6 +233,7 @@ def run_generation(
                                 engine,
                                 kv,
                                 spec_stats,
+                                cache_baseline,
                             ),
                         }
                     )
@@ -245,6 +244,7 @@ def run_generation(
                 engine,
                 kv,
                 spec_stats,
+                cache_baseline,
             )
 
             job.status = (
@@ -269,12 +269,26 @@ def run_generation(
     emit({"type": event_type, "job": job.public()})
 
 
+def _cache_snapshot(engine: Any) -> dict[str, dict[str, int]]:
+    """Point-in-time copy of the piece cache counters, used as a baseline so
+    `_metrics` can report deltas for the current job on a cache/engine that
+    is reused (and thus already warm) across jobs."""
+    stats = engine.cache.stats()
+
+    return {
+        "hits": dict(stats["hits"]),
+        "misses": dict(stats["misses"]),
+        "bytes_loaded": dict(stats["bytes_loaded"]),
+    }
+
+
 def _metrics(
     out_ids: list[int],
     t0: float,
     engine: Any,
     kv: KVStore | None,
     spec_stats: SpecStats | None,
+    cache_baseline: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, float]:
     elapsed = max(time.perf_counter() - t0, 1e-9)
 
@@ -289,6 +303,26 @@ def _metrics(
     if spec_stats is not None:
         metrics["multiplier"] = spec_stats.multiplier
         metrics["deviation_rate"] = spec_stats.deviation_rate
+
+    if cache_baseline is not None:
+        stats = engine.cache.stats()
+
+        eh = stats["hits"].get("expert", 0) - cache_baseline["hits"].get("expert", 0)
+        em = stats["misses"].get("expert", 0) - cache_baseline["misses"].get("expert", 0)
+
+        if eh + em > 0:
+            metrics["expert_hit_pct"] = 100.0 * eh / (eh + em)
+
+            bytes_loaded_delta = sum(
+                stats["bytes_loaded"].get(kind, 0)
+                - cache_baseline["bytes_loaded"].get(kind, 0)
+                for kind in stats["bytes_loaded"]
+            )
+
+            if out_ids:
+                metrics["mb_per_token"] = (
+                    bytes_loaded_delta / len(out_ids) / 1e6
+                )
 
     return metrics
 

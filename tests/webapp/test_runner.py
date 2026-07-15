@@ -1,6 +1,7 @@
 import json
 import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from nunspark.webapp.engine_pool import EnginePool
 from nunspark.webapp.runner import build_prompt, run_generation
@@ -41,6 +42,50 @@ def test_run_generation_writes_output_and_sidecar(tmp_path, tiny_packed_dir):
     assert meta["file_name"] == "doc.txt"
     assert "tok_per_s" in meta["metrics"]
     assert any(e["type"] == "token" for e in events)
+    assert events[-1]["type"] == "done"
+
+
+def test_run_generation_does_not_call_missing_pool_release(tmp_path, tiny_packed_dir):
+    """Regression test: EnginePool only exposes acquire/close, never release --
+    it is an intentional cross-job cache of one loaded engine (see its
+    docstring), not something a single job should tear down. run_generation
+    used to do `stack.callback(pool.release, handle)`, which raised
+    AttributeError the instant it ran against any real (non-mocked) pool.
+
+    We spec the mock to EnginePool so any attribute other than acquire/close
+    raises AttributeError immediately, exactly like the real class -- while
+    still delegating to a real EnginePool underneath so generation actually
+    runs against a real engine/tokenizer.
+    """
+    src = tmp_path / "doc.txt"
+    src.write_text("Hello world. This is a test document.")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    job = Job(
+        id="j5", batch_id="b1", file_name="doc.txt", file_path=str(src),
+        model=str(tiny_packed_dir), draft=None, preset="lossless",
+        instruction="Continue:", use_chat_template=False,
+        max_tokens=4, temperature=0.0, output_dir=str(out_dir),
+        advanced={"budget": "4GB"},
+    )
+
+    real_pool = EnginePool()
+    pool = MagicMock(spec=EnginePool)
+    pool.acquire.side_effect = real_pool.acquire
+    pool.close.side_effect = real_pool.close
+    assert not hasattr(pool, "release")
+
+    events = []
+    try:
+        run_generation(job, pool=pool,
+                        emit=lambda e: events.append(e),
+                        should_cancel=lambda: False)
+    finally:
+        real_pool.close()
+
+    assert job.status == JobStatus.DONE
+    assert job.error is None
     assert events[-1]["type"] == "done"
 
 
