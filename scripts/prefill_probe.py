@@ -30,10 +30,14 @@ def main() -> None:
     budget = int(float(sys.argv[2]) * (1 << 30))
     target_tokens = int(sys.argv[3])
     tag = sys.argv[4]
-    if len(sys.argv) > 5 and sys.argv[5] == "nowarm":
-        # Control arm: disable the bulk warm so both arms run the same binary.
-        from nunspark.piece_cache import PieceCache
-        PieceCache.warm_bulk = lambda self, pids: None
+    chunk = None
+    for extra in sys.argv[5:]:
+        if extra == "nowarm":
+            # Control arm: disable the bulk warm so both arms run the same binary.
+            from nunspark.piece_cache import PieceCache
+            PieceCache.warm_bulk = lambda self, pids: None
+        elif extra.startswith("chunk="):
+            chunk = int(extra.split("=", 1)[1])
 
     manifest = Manifest.load(root / "manifest.json")
     tokenizer = _load_tokenizer(root)
@@ -53,7 +57,11 @@ def main() -> None:
         s0 = engine.cache.stats()
         stall0 = engine._stall_seconds
         t0 = time.monotonic()
-        logits = engine.forward(mx.array(ids)[None], kv=kv)[:, -1, :]
+        if chunk is not None:
+            from nunspark.generate import _prefill
+            logits = _prefill(engine, ids, kv, chunk)
+        else:
+            logits = engine.forward(mx.array(ids)[None], kv=kv)[:, -1, :]
         first = int(mx.argmax(logits, axis=-1).item())  # forces the graph
         prefill_s = time.monotonic() - t0
         s1 = engine.cache.stats()

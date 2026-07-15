@@ -23,6 +23,23 @@ community verification pending.
 
 Original entry follows.
 
+**Addendum (2026-07-15): prompt-length memory safety.** The "not worth doing:
+chunked prefill" verdict below was I/O-scoped and stands; chunked prefill was
+nevertheless shipped as a MEMORY-safety fix after a field incident: a binary PDF
+uploaded to the web UI decoded to a garbage mega-prompt, whose single-pass
+prefill (unbounded activation + KV memory) swap-stormed a 16 GB Mac until the
+macOS watchdog killed WindowServer. Shipped: (a) `generate._prefill` — prompt
+processed in `--prefill-chunk`-sized windows (default 1024), each window's
+graph evaluated before the next, bit-identical incl. gpt-oss sliding-window
+rotation (tests/test_chunked_prefill.py); gemma4-MTP left unchunked (its
+assistant needs whole-prompt `target_kv_states`). Measured cost of chunking on
+Qwen3-30B (273 tokens, chunk=96, 3 windows): 2.6× expert re-reads across
+windows — the trade is deliberate; prompts <= chunk are single-pass and free.
+(b) Web UI guards in runner.py: binary/PDF uploads rejected by magic
+bytes/NUL/replacement-ratio; prompt tokens capped against unified RAM from a
+per-token KV estimate (override: `advanced.max_prompt_tokens`), failing loudly
+instead of truncating.
+
 **Problem.** 120B prefill is 57–95 s for ~100-token prompts on 16 GB. During
 prefill every prompt token fires its own experts, so the per-layer union touches a
 large fraction of all 128 experts — tens of GB of reads before the first token.

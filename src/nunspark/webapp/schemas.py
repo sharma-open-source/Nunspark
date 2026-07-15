@@ -46,6 +46,10 @@ class Advanced(BaseModel):
     budget: str = "4GB"
     accept_top_k: int | None = None
     num_draft_tokens: int | None = None
+    # Explicit override for the RAM-derived prompt-token cap in the runner.
+    # None means "derive from unified memory"; set it to accept the swap risk
+    # of a prompt whose KV cache may not fit.
+    max_prompt_tokens: int | None = None
 
 
 class BatchRequest(BaseModel):

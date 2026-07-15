@@ -12,6 +12,41 @@ from .engine import StreamingEngine
 from .kv_store import KVStore
 
 
+# Prompt is prefilled in fixed-size windows (mlx_lm's prefill_step_size idea):
+# a single-pass forward over the whole prompt makes activation memory unbounded
+# in prompt length, which on a 16 GB Mac starves WindowServer and trips the
+# macOS watchdog kill. Windowing caps peak activation memory at one chunk.
+PREFILL_CHUNK = 1024
+
+
+def _prefill(engine, ids, kv, chunk: int = PREFILL_CHUNK) -> mx.array:
+    """Run the prompt through the engine in fixed-size windows, appending to
+    the persistent kv, and return the last window's final-position logits.
+
+    Each window is one `engine.forward` against the kv, exactly like the
+    processed_tokens prefix-reuse path: the cache offset supplies the correct
+    positions for later windows (mask plans build from that offset), so the
+    output is bit-identical to a single-pass prefill.
+    """
+    n = len(ids)
+    if n == 0:
+        # Preserve the historical empty-prefill behavior exactly — a fully-cached
+        # prompt (processed_tokens == len(prompt)) sends an empty array; whatever
+        # forward() does with it (including raising) must stay unchanged.
+        return engine.forward(mx.array(ids)[None], kv=kv)[:, -1, :]
+    logits = None
+    for start in range(0, n, chunk):
+        w = ids[start:start + chunk]
+        logits = engine.forward(mx.array(w)[None], kv=kv)[:, -1, :]
+        # Force each window's graph (and its kv appends) before starting the
+        # next so peak activation memory stays bounded by one chunk — the whole
+        # point. The fully-resident fast path skips the engine's per-layer sync,
+        # so without this the lazy graph would span all chunks. Scheduling only:
+        # numerics are untouched.
+        mx.eval(logits)
+    return logits
+
+
 def _sample(logits: mx.array, temp: float) -> int:
     if temp <= 0.0:
         return int(mx.argmax(logits, axis=-1).item())
@@ -86,6 +121,7 @@ def generate(
     prefetch: bool = True,
     kv: KVStore | None = None,
     kv_quant: KVQuant | None = None,
+    prefill_chunk: int = PREFILL_CHUNK,
 ) -> list[int]:
     """Greedy/temperature decode using the streaming engine.
 
@@ -109,7 +145,7 @@ def generate(
             tmp.cleanup()
             raise
     try:
-        logits = engine.forward(mx.array(prompt)[None], kv=kv)[:, -1, :]
+        logits = _prefill(engine, prompt, kv, prefill_chunk)
         out: list[int] = []
         for _ in range(max_tokens):
             nxt = _sample(logits, temp)
@@ -132,6 +168,7 @@ def stream_generate(
     kv: KVStore | None = None,
     kv_quant: KVQuant | None = None,
     processed_tokens: int = 0,
+    prefill_chunk: int = PREFILL_CHUNK,
 ) -> Generator[int, None, None]:
     """Like generate(), but yields one token id at a time for live streaming.
 
@@ -156,8 +193,7 @@ def stream_generate(
             tmp.cleanup()
             raise
     try:
-        prefill = prompt[processed_tokens:]
-        logits = engine.forward(mx.array(prefill)[None], kv=kv)[:, -1, :]
+        logits = _prefill(engine, prompt[processed_tokens:], kv, prefill_chunk)
         for _ in range(max_tokens):
             nxt = _sample(logits, temp)
             yield nxt
@@ -182,6 +218,7 @@ def speculative_generate(
     eos_id: int | None = None,
     stats: SpecStats | None = None,
     processed_tokens: int = 0,
+    prefill_chunk: int = PREFILL_CHUNK,
 ) -> Generator[int, None, None]:
     """Speculative decoding over the streaming target.
 
@@ -226,8 +263,7 @@ def speculative_generate(
         # holds the first processed_tokens); the draft sees the full prompt.
         # b is the first confirmed token. The target's cache offset supplies the
         # correct positions for the suffix.
-        logits = engine.forward(
-            mx.array(prompt[processed_tokens:])[None], kv=kv)[:, -1, :]
+        logits = _prefill(engine, prompt[processed_tokens:], kv, prefill_chunk)
         draft_cache = make_prompt_cache(draft_model)
         draft_model(mx.array(prompt)[None], cache=draft_cache)
         b = int(mx.argmax(logits, axis=-1).item())
@@ -339,6 +375,7 @@ def ngram_speculative_generate(
     eos_id: int | None = None,
     stats: SpecStats | None = None,
     processed_tokens: int = 0,
+    prefill_chunk: int = PREFILL_CHUNK,
 ) -> Generator[int, None, None]:
     """Prompt-lookup (n-gram) speculative decoding over the streaming target.
 
@@ -377,8 +414,7 @@ def ngram_speculative_generate(
         # Prefill the target over the un-cached suffix; b is the first confirmed
         # token. `context` tracks prompt + everything emitted so far and is what
         # the drafter looks tokens up in.
-        logits = engine.forward(
-            mx.array(prompt[processed_tokens:])[None], kv=kv)[:, -1, :]
+        logits = _prefill(engine, prompt[processed_tokens:], kv, prefill_chunk)
         b = int(mx.argmax(logits, axis=-1).item())
         context = list(prompt)
         context.append(b)
@@ -510,6 +546,10 @@ def gemma4_mtp_speculative_generate(
             raise
     try:
         # Prefill the target; capture the state the drafter cross-attends to.
+        # NOT chunked: the MTP assistant cross-attends to target_kv_states()
+        # captured during THIS forward — those must cover the whole prompt.
+        # Windowing the prefill would leave only the last window's captured
+        # states, breaking the cross-attention, so this path stays single-pass.
         logits = engine.forward(mx.array(prompt)[None], kv=kv)[:, -1, :]
         last_hidden = engine.last_hidden_state()[:, -1:, :]
         kv_states = engine.target_kv_states()
@@ -704,7 +744,11 @@ def eagle_speculative_generate(
             tmp.cleanup()
             raise
     try:
-        logits = engine.forward(mx.array(prompt)[None], kv=kv)[:, -1, :]
+        # Chunked prefill is safe here: the drafter only consumes the LAST
+        # position of last_hidden_state() (the prompt's final token), which the
+        # last window still produces — unlike gemma4 MTP, no whole-prompt
+        # captured state is needed.
+        logits = _prefill(engine, prompt, kv)
         last_hidden = engine.last_hidden_state()
         b = int(mx.argmax(logits, axis=-1).item())
 
@@ -831,8 +875,8 @@ def adaptive_speculative_generate(
             tmp.cleanup()
             raise
     try:
-        # Prefill both models over the prompt
-        logits = engine.forward(mx.array(prompt)[None], kv=kv)[:, -1, :]
+        # Prefill both models over the prompt (target in bounded windows).
+        logits = _prefill(engine, prompt, kv)
         draft_cache = make_prompt_cache(draft_model)
         draft_model(mx.array(prompt)[None], cache=draft_cache)
         b = int(mx.argmax(logits, axis=-1).item())
