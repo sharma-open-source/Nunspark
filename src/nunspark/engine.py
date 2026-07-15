@@ -600,6 +600,20 @@ class StreamingEngine:
         batch_tokens = inds.shape[0] * inds.shape[1]   # B*L positions this pass routed
         if self._trace_fh is not None:
             self._trace_moe(layer, fired, batch_tokens)
+        # Multi-token bulk-warm (prefill / spec verify): the router just told us
+        # the COMPLETE set of expert pieces this layer needs before we touch any of
+        # them. _scatter_experts below fetches them SERIALLY via cache.get, each
+        # miss a single-threaded cold mmap fault (~300 MB/s) — essentially the whole
+        # time-to-first-token on selectively-packed MoE. Kicking off a parallel
+        # page-cache warm of exactly that set first lets the serial get loop read
+        # warm pages instead. Gated on _cur_pass_multi ONLY: this is demand-critical
+        # (not speculative, so not gated on _prefetch), but single-token greedy
+        # decode must stay untouched — its fired sets are small, M3 speculative
+        # prefetch already covers that regime, and Phase-1 showed warming is
+        # net-negative for decode.
+        if self._cur_pass_multi:
+            self.cache.warm_bulk(
+                Manifest.layer_expert_piece_id(layer, e) for e in fired)
         self._scatter_experts(slot, layer, fired)
         if self._expert_prefetch:
             # Remember this pass's fired set so the NEXT pass can prefetch it.

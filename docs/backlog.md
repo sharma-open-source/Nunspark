@@ -3,7 +3,25 @@
 Ideas we have decided are worth doing but are not scheduled into a plan yet.
 Each entry records the motivation and enough design detail to start cold.
 
-## 1. Prefill / time-to-first-token optimization (HIGH — next side-experiment)
+## 1. Prefill / time-to-first-token optimization (DONE 2026-07-15 — shipped)
+
+**Outcome.** Implemented as `PieceCache.warm_bulk`: right after a layer's router
+fires on a multi-token pass, the complete fired-expert piece list is raw-read by
+an 8-thread pool to populate the OS page cache while `_scatter_experts`'s serial
+`get()` loop runs — converting single-threaded mmap demand-faults (~360–510 MB/s
+measured) into queue-deep reads (0.73–1.36 GB/s measured; SSD sequential
+reference 2.4 GB/s). Gated on multi-token passes only, so single-token greedy
+decode is untouched (Phase-1's "warming is net-negative for decode" verdict
+still honored). Measured on Qwen3-30B-A3B, 273-token prompt, 8 GB budget,
+interleaved A/B with page-cache flushes between runs
+(scripts/results/prefill_bulkwarm_ab.json, probe: scripts/prefill_probe.py):
+prefill **21.6–30.8 s → 8.1–15.0 s** (~2× median, up to 3.8×), identical bytes,
+misses, and first token (lossless); 200-token greedy decode after the change
+1.62 tok/s vs 1.65 before, identical cache counters. Expected to transfer
+directly to gpt-oss-120b (same serial-fault bottleneck, 57–95 s TTFT) —
+community verification pending.
+
+Original entry follows.
 
 **Problem.** 120B prefill is 57–95 s for ~100-token prompts on 16 GB. During
 prefill every prompt token fires its own experts, so the per-layer union touches a

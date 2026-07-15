@@ -177,6 +177,12 @@ class PieceCache:
             if io_threads > 1 and pather is not None
             else None
         )
+        # Separate pool for warm_bulk() (the demand-critical prefill/verify bulk
+        # warm), created lazily on first use so single-token decode never pays for
+        # it. Kept distinct from _warm_pool: that one belongs to the speculative
+        # prefetch path (only when io_threads>1); warm_bulk is a pure page-cache
+        # populate that never touches _inflight/queue/staging accounting.
+        self._bulk_warm_pool: ThreadPoolExecutor | None = None
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -326,6 +332,48 @@ class PieceCache:
         finally:
             os.close(fd)
 
+    def warm_bulk(self, pids: Iterable[str]) -> None:
+        """Fire-and-forget parallel page-cache warm of a known-in-advance bulk of
+        pieces (the demand-critical prefill / spec-verify expert set, computed
+        after the router but BEFORE the serial get() loop touches any of them).
+        Raw-reading these files with a small thread pool reaches SSD bandwidth and
+        populates the OS page cache, so the subsequent serial mx.load+mx.eval in
+        get()'s materialize path reads warm pages instead of cold-faulting each
+        file single-threaded.
+
+        Pure page-cache populate: NO accounting is touched (no _inflight reserve,
+        no miss counters, no staging) — get() keeps all bookkeeping, and a get()
+        racing a warm of the same file is harmless (concurrent reads). Pids that
+        are already resident / staged / in-flight need no disk read (or one is
+        already happening), so they are skipped. No-op without a _pather (nothing
+        to raw-read). We do NOT wait on the submitted warms: the serial get loop
+        that follows overlaps with them, the OS page cache mediating."""
+        if self._pather is None:
+            return
+        with self._lock:
+            todo = [
+                pid for pid in pids
+                if pid not in self._region(pid)
+                and pid not in self._staging
+                and pid not in self._inflight
+            ]
+            if not todo:
+                return
+            if self._bulk_warm_pool is None:
+                self._bulk_warm_pool = ThreadPoolExecutor(
+                    max_workers=8, thread_name_prefix="nunspark-bulkwarm")
+            pool = self._bulk_warm_pool
+            for pid in todo:
+                pool.submit(self._warm_one_best_effort, pid)
+
+    def _warm_one_best_effort(self, pid: str) -> None:
+        # Best-effort raw read (like _warm_then_queue): a failed warm just means
+        # the subsequent get() materialize reads that file cold.
+        try:
+            self._warm(pid)
+        except Exception:
+            pass
+
     def close(self) -> None:
         # Swap the pool out under the lock so a concurrent prefetch() either sees a
         # live pool (and submits) or None (and uses the queue) — never submits to a
@@ -334,8 +382,14 @@ class PieceCache:
         # materialize worker with the sentinel. Safe to call twice.
         with self._lock:
             pool, self._warm_pool = self._warm_pool, None
+            bulk_pool, self._bulk_warm_pool = self._bulk_warm_pool, None
         if pool is not None:
             pool.shutdown(wait=True)
+        # Bulk warms are best-effort raw page-cache reads, so we needn't wait for
+        # them; swapped out under the lock (same care as _warm_pool) so a
+        # concurrent warm_bulk sees None and never submits to a shut-down pool.
+        if bulk_pool is not None:
+            bulk_pool.shutdown(wait=False)
         # Sentinel tier 3 sorts after demand (0) and speculative (1), so any
         # already-queued prefetches drain before the worker stops.
         self._pq.put((3, next(self._seq), None))

@@ -463,13 +463,17 @@ is nearly free.
 
 # Future Work
 
-- **Prefill / TTFT bulk read.** 120B prefill takes 57-95 s on 16 GB
-  because prefill's per-layer expert union is large and reads go
-  through demand-faulted mmap at ~300 MB/s. Since prefill's fired-expert
-  set is fully known right after each layer's router runs (unlike
-  decode's unpredictable access pattern), a batched/`madvise`-driven
-  bulk read per layer could hit sequential-class SSD bandwidth instead.
-  Target: 57-95 s -> 15-30 s.
+- **Prefill / TTFT bulk read.** *Done since this report was first
+  drafted.* 120B prefill takes 57-95 s on 16 GB because prefill's
+  per-layer expert union is large and reads go through demand-faulted
+  mmap at ~300 MB/s. Since prefill's fired-expert set is fully known
+  right after each layer's router runs (unlike decode's unpredictable
+  access pattern), a bulk read per layer can hit queue-deep SSD
+  bandwidth instead. Shipped as `PieceCache.warm_bulk` (parallel
+  page-cache warm of the fired union, multi-token passes only):
+  Qwen3-30B 273-token prefill 21.6-30.8 s -> 8.1-15.0 s (~2x median,
+  up to 3.8x), lossless, decode unaffected
+  (scripts/results/prefill_bulkwarm_ab.json).
 - **Persistent prompt-prefix KV cache.** Save/load the shared
   system-prompt prefix's KV state to disk so repeat sessions skip
   prefill of the shared prefix entirely; stacks with the bulk-read
