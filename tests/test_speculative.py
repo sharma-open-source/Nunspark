@@ -2,6 +2,7 @@ import json
 
 import mlx.core as mx
 from mlx_lm.models.llama import Model, ModelArgs
+from mlx_lm.models.gpt_oss import Model as GptOssModel, ModelArgs as GptOssModelArgs
 
 from nunspark.manifest import Manifest
 from nunspark.packer import pack
@@ -100,6 +101,84 @@ def test_eos_stops_mid_block(tiny_model_dir, tmp_path):
     finally:
         engine.close()
     assert got == expected
+
+
+# A dense tiny Llama sharing the gpt-oss fixture's 320-token vocab: a resident
+# draft whose full-attention KVCache trims exactly (the supported draft shape),
+# driving a sliding-window (RotatingKVCache) streaming target.
+_DENSE_DRAFT_CONFIG = {
+    "model_type": "llama",
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-5,
+    "vocab_size": 320,
+    "rope_theta": 10000.0,
+    "tie_word_embeddings": True,
+}
+
+
+def _random_dense_draft(seed: int):
+    mx.random.seed(seed)
+    model = Model(ModelArgs.from_dict(_DENSE_DRAFT_CONFIG))
+    mx.eval(model.parameters())
+    return model
+
+
+def test_gpt_oss_rotating_cache_imperfect_draft_matches_greedy(
+    tiny_gpt_oss_model_dir, tmp_path
+):
+    # gpt-oss alternates sliding-window (RotatingKVCache, window 4 here) and
+    # full attention. The 15-token prompt rotates every sliding cache during
+    # prefill; generation keeps rotating them. Regression for the community
+    # crash on gpt-oss-120b: (1) the global mask used to be built from layer
+    # 0's rotating cache and came out clamped to the window (broadcast crash
+    # on the first K+1-token verify pass), and (2) kv.truncate rollback is
+    # unsound on a rotated RotatingKVCache — the verify pass now runs on
+    # ephemeral cache clones and commits only the accepted prefix. A random
+    # dense draft (same vocab, unrelated weights) forces rejections, so
+    # commits happen at varying m, including m=0.
+    prompt = [3, 7, 42, 1, 9] * 3
+    engine = _build_engine(tiny_gpt_oss_model_dir, tmp_path)
+    try:
+        ref = generate(engine, prompt, max_tokens=24, temp=0.0)
+        draft = _random_dense_draft(seed=123)
+        stats = SpecStats()
+        got = list(speculative_generate(
+            engine, draft, prompt, max_tokens=24, num_draft_tokens=4, stats=stats))
+    finally:
+        engine.close()
+    assert got == ref
+    assert len(got) == 24
+    assert stats.accepted_offpath == 0      # lossless default path
+    assert stats.accepted_total <= stats.draft_tokens_proposed
+
+
+def test_gpt_oss_rotating_cache_self_draft_matches_greedy(
+    tiny_gpt_oss_model_dir, tmp_path
+):
+    # Same target, but the draft IS the target model (resident mlx_lm copy):
+    # every draft token is accepted, so every round commits the full K+1 block
+    # (> window 4) into the rotated sliding caches — the m == K commit path.
+    config = json.loads((tiny_gpt_oss_model_dir / "config.json").read_text())
+    draft = GptOssModel(GptOssModelArgs.from_dict(config))
+    draft.load_weights(
+        list(mx.load(str(tiny_gpt_oss_model_dir / "model.safetensors")).items()))
+    mx.eval(draft.parameters())
+
+    prompt = [3, 7, 42, 1, 9] * 3
+    engine = _build_engine(tiny_gpt_oss_model_dir, tmp_path)
+    try:
+        ref = generate(engine, prompt, max_tokens=24, temp=0.0)
+        stats = SpecStats()
+        got = list(speculative_generate(
+            engine, draft, prompt, max_tokens=24, num_draft_tokens=4, stats=stats))
+    finally:
+        engine.close()
+    assert got == ref
+    assert stats.accepted_total > 0
 
 
 def test_specstats_deviation_rate():

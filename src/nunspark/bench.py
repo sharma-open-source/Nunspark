@@ -20,7 +20,9 @@ import mlx.core as mx
 
 from .manifest import Manifest
 from .engine import StreamingEngine
-from .generate import stream_generate, speculative_generate, SpecStats
+from .generate import (
+    stream_generate, speculative_generate, ngram_speculative_generate, SpecStats)
+from .ngram_drafter import NGramDrafter
 
 _UNITS = [("TB", 1000**4), ("GB", 1000**3), ("MB", 1000**2), ("KB", 1000),
           ("T", 1000**4), ("G", 1000**3), ("M", 1000**2), ("K", 1000), ("B", 1)]
@@ -71,7 +73,7 @@ def _encode(tokenizer, prompt: str) -> list[int]:
 
 def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, mode: str,
             *, budget_bytes: int, max_tokens: int, draft_tokens: int,
-            draft_model=None) -> dict:
+            draft_model=None, drafter=None) -> dict:
     """Build a FRESH engine for this run (independent cache stats / peak memory),
     stream up to max_tokens greedy or speculative tokens via the existing
     generate() entry points, and return a metrics dict. Mirrors
@@ -79,9 +81,14 @@ def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, 
     engine = StreamingEngine(packed, manifest, budget_bytes=budget_bytes)
     try:
         mx.reset_peak_memory()
-        spec_stats = SpecStats() if mode == "spec" else None
+        spec_stats = SpecStats() if mode in ("spec", "ngram-spec") else None
 
-        if mode == "spec":
+        if mode == "ngram-spec":
+            gen = ngram_speculative_generate(
+                engine, drafter, ids, max_tokens=max_tokens,
+                eos_id=eos, stats=spec_stats,
+            )
+        elif mode == "spec":
             gen = speculative_generate(
                 engine, draft_model, ids, max_tokens=max_tokens,
                 num_draft_tokens=draft_tokens, accept_top_k=1,
@@ -161,13 +168,16 @@ def run_bench(
     max_tokens: int = 100,
     workloads: list[str] | None = None,
     out: Path | None = None,
+    ngram: bool = False,
 ) -> list[dict]:
     """Run the bench suite over an already-packed model dir.
 
     For each workload prompt in `workloads` (default: all of PROMPTS' labels),
-    runs greedy decode, then (if `draft` is given) speculative decode. Prints
-    live progress as runs complete. Returns the list of per-run metrics dicts;
-    writes them (plus a meta block) to `out` as JSON if given.
+    runs greedy decode, then a speculative decode. The speculative arm uses the
+    model-free prompt-lookup (n-gram) drafter when `ngram` is True (mode
+    "ngram-spec"), otherwise a draft model when `draft` is given (mode "spec").
+    Prints live progress as runs complete. Returns the list of per-run metrics
+    dicts; writes them (plus a meta block) to `out` as JSON if given.
     """
     packed = Path(packed)
     manifest = Manifest.load(packed / "manifest.json")
@@ -178,8 +188,10 @@ def run_bench(
 
     prompts = PROMPTS if not workloads else [(l, p) for l, p in PROMPTS if l in workloads]
 
+    ngram_drafter = NGramDrafter(num_draft_tokens=draft_tokens) if ngram else None
+
     draft_model = None
-    if draft:
+    if draft and not ngram:
         from mlx_lm import load as load_full
         print(f"Loading draft {draft} ...")
         draft_model, draft_tok = load_full(draft)
@@ -204,7 +216,15 @@ def run_bench(
         print(f"    {r['tok_s_decode']:.2f} tok/s, peak {r['peak_memory_gb']:.2f} GB, "
               f"{r['tokens_generated']} tokens")
 
-        if draft_model is not None:
+        if ngram_drafter is not None:
+            print(f"  ngram-spec (K={draft_tokens}) ...")
+            r = _run_one(packed, manifest, ids, eos, label, "ngram-spec",
+                         budget_bytes=budget_bytes, max_tokens=max_tokens,
+                         draft_tokens=draft_tokens, drafter=ngram_drafter)
+            results.append(r)
+            print(f"    {r['tok_s_decode']:.2f} tok/s, M={r['spec_stats']['multiplier']:.2f}, "
+                  f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens")
+        elif draft_model is not None:
             print(f"  spec (K={draft_tokens}) ...")
             r = _run_one(packed, manifest, ids, eos, label, "spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
@@ -222,6 +242,7 @@ def run_bench(
             "meta": {
                 "packed": str(packed),
                 "draft": draft,
+                "ngram": ngram,
                 "draft_tokens": draft_tokens,
                 "max_tokens": max_tokens,
                 "budget_bytes": budget_bytes,
