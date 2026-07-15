@@ -95,23 +95,31 @@ class PerLayer:
     """Per-layer attention masks for heterogeneous attention.
 
     `kinds[i]` is "global" (full causal) or ("sliding", window). One mask is
-    built per *distinct kind value* from layer 0's cache offset and shared by
-    all layers of that kind — typically two (one global + one sliding window),
-    but a model mixing several window sizes builds one array per size.
+    built per *distinct kind value* and shared by all layers of that kind —
+    typically two (one global + one sliding window), but a model mixing
+    several window sizes builds one array per size.
+
+    Each kind's mask is built from the cache of the FIRST layer of that same
+    kind — never from layer 0 unconditionally. create_attention_mask delegates
+    to cache.make_mask, and RotatingKVCache.make_mask clamps its offset to the
+    window, so building the global mask from a sliding layer's rotating cache
+    (as gpt-oss layer 0 is) yields a mask too short for the full-attention
+    layers' keys once the sequence exceeds the window (broadcast crash on any
+    multi-token pass past that point).
     """
     kinds: list
 
     def build(self, h, kv) -> MaskIndex:
-        cache0 = kv.get(0) if kv is not None else None
         built: dict = {}
         masks = []
-        for kind in self.kinds:
+        for i, kind in enumerate(self.kinds):
             if kind not in built:
+                cache_i = kv.get(i) if kv is not None else None
                 if kind == "global":
-                    built[kind] = create_attention_mask(h, cache0)
+                    built[kind] = create_attention_mask(h, cache_i)
                 elif isinstance(kind, tuple) and len(kind) == 2 and kind[0] == "sliding":
                     _, window = kind
-                    built[kind] = create_attention_mask(h, cache0, window_size=window)
+                    built[kind] = create_attention_mask(h, cache_i, window_size=window)
                 else:
                     raise ValueError(f"unknown mask kind: {kind!r}")
             masks.append(built[kind])

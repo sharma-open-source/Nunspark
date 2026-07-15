@@ -68,6 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Path to draft model for speculative decoding (mlx_lm format)")
     p_gen.add_argument("--eagle-drafter", default=None,
                        help="Path to trained EAGLE drafter weights (feature-level speculation, no full draft model needed)")
+    p_gen.add_argument("--ngram-draft", action="store_true",
+                       help="prompt-lookup (n-gram) speculative decoding: model-free drafter "
+                            "that proposes --num-draft-tokens tokens by finding the most recent "
+                            "prior occurrence of the context suffix (lossless; no draft model). "
+                            "Mutually exclusive with --draft-model / --eagle-drafter")
+    p_gen.add_argument("--ngram-max", type=int, default=3,
+                       help="longest suffix n-gram tried by --ngram-draft (default: 3)")
     p_gen.add_argument("--num-draft-tokens", type=int, default=16,
                        help="Number of draft tokens to propose per iteration (default: 16)")
     p_gen.add_argument("--accept-top-k", type=int, default=1,
@@ -140,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="draft model for speculative runs (default: Qwen/Qwen3-0.6B)")
     p_bench.add_argument("--no-spec", action="store_true",
                          help="skip speculative runs entirely (greedy only)")
+    p_bench.add_argument("--ngram", action="store_true",
+                         help="run the speculative arm with the model-free prompt-lookup "
+                              "(n-gram) drafter instead of a draft model (mode 'ngram-spec'); "
+                              "uses --draft-tokens as K, no draft download")
     p_bench.add_argument("--draft-tokens", type=int, default=24)
     p_bench.add_argument("--budget", default="8GB",
                          help="PieceCache byte budget, e.g. 512MB, 8GB (default 8GB)")
@@ -164,6 +175,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "generate":
+        if args.ngram_draft and (args.draft_model or args.eagle_drafter):
+            print("Error: --ngram-draft is mutually exclusive with "
+                  "--draft-model / --eagle-drafter", file=sys.stderr)
+            return 1
         manifest = Manifest.load(Path(args.packed_dir) / "manifest.json")
         engine = StreamingEngine(
             args.packed_dir, manifest,
@@ -211,6 +226,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             print(f"Prompt -> {len(prompt)} tokens", file=sys.stderr)
+
+            # Build the model-free n-gram drafter if requested
+            ngram_drafter = None
+            if args.ngram_draft:
+                from .ngram_drafter import NGramDrafter
+                ngram_drafter = NGramDrafter(
+                    max_ngram=args.ngram_max,
+                    num_draft_tokens=args.num_draft_tokens,
+                )
+                print(f"  n-gram drafter (max_ngram={args.ngram_max}, "
+                      f"K={args.num_draft_tokens})", file=sys.stderr)
 
             # Load EAGLE drafter if provided (feature-level speculation)
             eagle_drafter = None
@@ -345,10 +371,19 @@ def main(argv: list[str] | None = None) -> int:
                 out_ids: list[int] = []
 
                 from .generate import SpecStats
-                use_spec = draft_model is not None or eagle_drafter is not None
+                use_spec = (draft_model is not None or eagle_drafter is not None
+                            or ngram_drafter is not None)
                 spec_stats = SpecStats() if use_spec else None
 
-                if eagle_drafter is not None:
+                if ngram_drafter is not None:
+                    from .generate import ngram_speculative_generate
+                    token_iter = ngram_speculative_generate(
+                        engine, ngram_drafter, prompt,
+                        max_tokens=args.max_tokens,
+                        kv=kv, eos_id=eos, stats=spec_stats,
+                        kv_quant=kv_quant,
+                    )
+                elif eagle_drafter is not None:
                     from .generate import eagle_speculative_generate
                     token_iter = eagle_speculative_generate(
                         engine, eagle_drafter, prompt,
@@ -512,10 +547,12 @@ def main(argv: list[str] | None = None) -> int:
                 pack_model(model_arg, packed_dir)
 
         draft = None if args.no_spec else args.draft
+        ngram = args.ngram and not args.no_spec
         if args.quick:
             workloads = ["prose"]
             max_tokens = 50
             draft = None    # --quick is a greedy-only smoke run (matches the help text)
+            ngram = False
         else:
             workloads = None
             max_tokens = args.max_tokens
@@ -524,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         results = run_bench(
             packed_dir, draft=draft, draft_tokens=args.draft_tokens,
             budget=_parse_size(args.budget), max_tokens=max_tokens,
-            workloads=workloads, out=out_path,
+            workloads=workloads, out=out_path, ngram=ngram,
         )
 
         info = system_info()

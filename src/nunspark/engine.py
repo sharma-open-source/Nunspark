@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map, tree_unflatten
 from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
 from .architectures import get_architecture
 from .archspec import LayerContext, UniformCausal
@@ -97,6 +97,61 @@ def _append_quantized_rows(cache: QuantizedKVCache, k_rows, v_rows) -> None:
     for i in range(len(cache.keys)):
         cache.keys[i][..., prev:cache.offset, :] = k_rows[i]
         cache.values[i][..., prev:cache.offset, :] = v_rows[i]
+
+
+def _clone_kv_cache(pcache):
+    """A same-type cache object seeded with `pcache`'s state, for one EPHEMERAL
+    verify pass. Buffers are shared (mlx arrays are immutable: an in-place
+    cache update rebinds only the clone's own attribute references) but every
+    python object is DISTINCT — full-range slices, never the same array object
+    — so appending to the clone can never mutate the persistent cache.
+
+    RotatingKVCache is cloned field-by-field (its circular-buffer bookkeeping
+    `_idx` and the raw rotated buffer must survive; `state` would reorder or
+    truncate). KVCache/QuantizedKVCache clone via `state`, exactly as
+    tree_forward seeds its ephemeral batched caches."""
+    if isinstance(pcache, RotatingKVCache):
+        c = RotatingKVCache(pcache.max_size, keep=pcache.keep)
+        if pcache.keys is not None:
+            c.keys = pcache.keys[:]
+            c.values = pcache.values[:]
+        c.offset = pcache.offset
+        c._idx = pcache._idx
+        return c
+    if isinstance(pcache, QuantizedKVCache):
+        c = QuantizedKVCache(group_size=pcache.group_size, bits=pcache.bits)
+        if pcache.keys is not None:
+            c.state = tree_map(lambda x: x[:], pcache.state)
+            c.offset = pcache.offset    # state setter doesn't set it
+        return c
+    c = KVCache()
+    if pcache.keys is not None:
+        pk, pv = pcache.state           # sliced to offset; setter derives offset
+        c.state = (pk[:], pv[:])
+    return c
+
+
+class _RecordingCache:
+    """Wraps one ephemeral verify-pass cache and records the raw new-token
+    (keys, values) the attention layer appends via update_and_fetch — RoPE'd
+    exactly as a persistent pass would produce them — so the accepted prefix
+    can later be committed to the persistent cache through its own
+    update_and_fetch (rotation-safe and quantization-exact by construction:
+    QuantizedKVCache.update_and_fetch takes raw rows and quantizes over
+    head_dim groups only). Everything else, including the `bits`/`group_size`
+    duck-typing mlx_lm's SDPA helper probes with hasattr, is delegated to the
+    wrapped cache."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.recorded = None
+
+    def update_and_fetch(self, keys, values):
+        self.recorded = (keys, values)
+        return self.inner.update_and_fetch(keys, values)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 class StreamingEngine:
@@ -414,11 +469,15 @@ class StreamingEngine:
             self._trace_fh.flush()
             self._trace_buf.clear()
 
-    def _moe_layer_forward(self, h, mask, kv, layer: int):
+    def _moe_layer_forward(self, h, mask, kv, layer: int, cache_override=None):
         """Selective MoE layer: load core, run the router, load only the fired
         experts, then run the expert mix. Mirrors the reference decoder layer +
         sparse-MoE block exactly (router math via spec.moe_route) so the output
-        is bit-identical — qwen3_moe and gpt_oss share this path."""
+        is bit-identical — qwen3_moe and gpt_oss share this path.
+
+        `cache_override`, if given, is used as the attention cache instead of
+        `kv.get(layer)` — verify_forward passes an ephemeral clone so the
+        persistent kv is never mutated by a speculative verify pass."""
         slot = self._get_slot(layer)
         core = self.cache.get(Manifest.layer_core_piece_id(layer))
         slot.update(tree_unflatten(list(core.items())))   # attn, norms, router
@@ -445,7 +504,10 @@ class StreamingEngine:
                 if spec_pids:
                     self.cache.prefetch(spec_pids, speculative=True)
 
-        cache = kv.get(layer) if kv is not None else None
+        if cache_override is not None:
+            cache = cache_override
+        else:
+            cache = kv.get(layer) if kv is not None else None
         h = self._moe_attn_and_mix(slot, layer, h, mask, cache)
         mx.eval(h)
         return h
@@ -691,6 +753,78 @@ class StreamingEngine:
                 _append_quantized_rows(cache, tree_map(sl, ek), tree_map(sl, ev))
             else:
                 cache.update_and_fetch(sl(ek), sl(ev))
+
+    def verify_forward(self, tokens: mx.array, kv):
+        """Multi-token verify pass over EPHEMERAL per-layer cache clones —
+        the same math as `forward()`, but the persistent `kv` is NEVER mutated.
+
+        Speculative verify passes need rollback of rejected tokens, and
+        trim-based rollback is unsound for RotatingKVCache once it has rotated
+        (evicted positions cannot be restored; `is_trimmable()` is False past
+        the window). Instead each layer runs on a `_clone_kv_cache` of its
+        persistent cache wrapped in a `_RecordingCache`; the caller commits
+        only the accepted prefix afterwards via `commit_verified` — the
+        ephemeral/commit pattern of `tree_forward`/`commit_path`, generalized
+        to heterogeneous (rotating + full) cache stacks.
+
+        Masks are built from the persistent caches' offsets, which equal the
+        clones' starting offsets, so they are exactly what `forward()` would
+        build. Returns `(logits, recs)` where `recs[layer].recorded` holds the
+        raw new-token (keys, values) for that layer.
+        """
+        self.cache.begin_pass()
+        self._cur_pass_multi = tokens.size > 1
+        self._maybe_reset_prefetch(kv)
+        self._lctx.shared_kv.clear()
+        self._lctx.target_kv_states.clear()
+        h = self._embed(tokens)
+        if self._embed_scale is not None:
+            h = h * self._embed_scale
+        masks = self._mask_plan.build(h, kv)
+
+        recs: list[_RecordingCache] = []
+        n = self.manifest.num_layers
+        for layer in range(n):
+            rec = _RecordingCache(_clone_kv_cache(kv.get(layer)))
+            recs.append(rec)
+            if self.manifest.has_piece(Manifest.layer_core_piece_id(layer)):
+                h = self._moe_layer_forward(h, masks[layer], kv, layer,
+                                            cache_override=rec)
+                continue
+
+            pid = Manifest.layer_piece_id(layer)
+            weights = self.cache.get(pid)
+            slot = self._get_slot(layer)
+            slot.update(tree_unflatten(list(weights.items())))
+            if self._prefetch and layer + 1 < n:
+                hi = min(layer + 1 + self._warm_window, n)
+                self.cache.prefetch([self._prefetch_pid(l) for l in range(layer + 1, hi)])
+                kv.prefetch(list(range(layer + 1, hi)))
+
+            h = self._runner.run(self._lctx, slot, layer, h, masks[layer], rec)
+            mx.eval(h)
+
+        self._lctx.shared_kv.clear()
+        h = self._norm(h)
+        self._last_hidden = h
+        logits = self._head(h)
+        if self._logit_transform is not None:
+            logits = self._logit_transform(logits)
+        return logits, recs
+
+    def commit_verified(self, kv, recs, accepted_len: int) -> None:
+        """Append the first `accepted_len` new-token K/V rows recorded by
+        `verify_forward` to the persistent `kv` — no re-feed, no extra weight
+        read, no trim. Each persistent cache receives the rows through its OWN
+        `update_and_fetch`, so rotation (RotatingKVCache) and quantization
+        (QuantizedKVCache quantizes raw rows over head_dim groups) behave
+        bit-identically to having fed the accepted tokens directly."""
+        if accepted_len <= 0:
+            return
+        for layer, rec in enumerate(recs):
+            k, v = rec.recorded
+            kv.get(layer).update_and_fetch(
+                k[..., :accepted_len, :], v[..., :accepted_len, :])
 
     def close(self) -> None:
         """Shut down the cache's background prefetch worker."""

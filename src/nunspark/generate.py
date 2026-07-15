@@ -320,6 +320,148 @@ def speculative_generate(
             tmp.cleanup()
 
 
+def ngram_speculative_generate(
+    engine: StreamingEngine,
+    drafter,
+    prompt: list[int],
+    max_tokens: int = 64,
+    kv_budget: int = 10**12,
+    prefetch: bool = True,
+    kv: KVStore | None = None,
+    kv_quant: KVQuant | None = None,
+    eos_id: int | None = None,
+    stats: SpecStats | None = None,
+    processed_tokens: int = 0,
+) -> Generator[int, None, None]:
+    """Prompt-lookup (n-gram) speculative decoding over the streaming target.
+
+    A model-free `drafter` (an `NGramDrafter`) proposes draft tokens by finding
+    the most recent prior occurrence of the current context suffix and returning
+    the tokens that followed; the streamed target verifies them in ONE forward
+    pass. This is LOSSLESS greedy: a draft token is accepted only if it equals
+    the target's argmax, so the output is bit-identical to plain `generate()`
+    regardless of draft quality. When the drafter finds no match it returns [],
+    and this round degrades to a single greedy target step.
+
+    Even modest acceptance amortizes the streaming cost of a multi-token verify
+    pass (core re-reads + overlapping expert unions) over several emitted tokens,
+    and the multi-token verify pass automatically enables M3 speculative expert
+    prefetch (`engine._cur_pass_multi`). SpecStats semantics match
+    `speculative_generate` so bench reporting is unchanged: `draft_tokens_proposed`
+    counts proposed n-gram tokens, `accepted_total` counts accepted ones (the
+    bonus correction is not a draft token), `target_passes` counts every target
+    forward (verify sweeps AND single greedy fallbacks).
+
+    KVStore lifecycle and `processed_tokens` semantics follow `generate()`;
+    `kv_quant`, if given, quantizes the KV cache (unsupported on attention-sink
+    architectures; raises ValueError).
+    """
+    check_kv_quant_support(engine, kv_quant)
+    own_kv = kv is None
+    tmp = None
+    if own_kv:
+        tmp = tempfile.TemporaryDirectory(prefix="nunspark_kv_")
+        try:
+            kv = _open_kv_store(engine, tmp.name, kv_budget, prefetch, kv_quant)
+        except BaseException:
+            tmp.cleanup()
+            raise
+    try:
+        # Prefill the target over the un-cached suffix; b is the first confirmed
+        # token. `context` tracks prompt + everything emitted so far and is what
+        # the drafter looks tokens up in.
+        logits = engine.forward(
+            mx.array(prompt[processed_tokens:])[None], kv=kv)[:, -1, :]
+        b = int(mx.argmax(logits, axis=-1).item())
+        context = list(prompt)
+        context.append(b)
+
+        emitted = 0
+        yield b
+        emitted += 1
+        if stats:
+            stats.tokens_emitted += 1
+        if b == eos_id:
+            return
+
+        while emitted < max_tokens:
+            # 1) Draft tokens by prompt-lookup on the current context.
+            q = drafter.propose(context)
+
+            if not q:
+                # No n-gram match -> single greedy target step. b (not yet in the
+                # cache) is fed once, producing the next token.
+                nl = engine.forward(mx.array([b])[None], kv=kv)[:, -1, :]
+                if stats:
+                    stats.target_passes += 1
+                nxt = int(mx.argmax(nl, axis=-1).item())
+                yield nxt
+                emitted += 1
+                if stats:
+                    stats.tokens_emitted += 1
+                context.append(nxt)
+                if nxt == eos_id:
+                    return
+                b = nxt
+                continue
+
+            Kq = len(q)
+            if stats:
+                stats.draft_tokens_proposed += Kq
+
+            # 2) Verify [b, q0..q_{Kq-1}] in one EPHEMERAL target sweep -> Kq+1
+            #    logit rows. verify_forward never mutates the persistent kv:
+            #    trim-based rollback is unsound for RotatingKVCache (sliding-
+            #    window archs like gpt-oss) once it has rotated, so rejected
+            #    tokens are simply never committed instead of trimmed away.
+            vlog, recs = engine.verify_forward(mx.array([b] + q)[None], kv)
+            targ = mx.argmax(vlog[0], axis=-1).tolist()   # targ[i] = argmax after position i
+            if stats:
+                stats.target_passes += 1
+
+            # 3) Accept the longest prefix where draft == target argmax (lossless).
+            m = 0
+            for i in range(Kq):
+                if q[i] != targ[i]:
+                    break
+                m += 1
+            if stats:
+                stats.accepted_total += m
+            bonus = int(targ[m])   # correct token after last accepted (m <= Kq, len(targ)=Kq+1)
+
+            # 4) Commit the accepted prefix [b, q0..q_{m-1}] (m+1 tokens) to the
+            #    persistent kv. The bonus token is NOT committed — it becomes the
+            #    next round's bootstrap b and enters the cache on that pass,
+            #    exactly like the round-1 bootstrap.
+            engine.commit_verified(kv, recs, m + 1)
+
+            # 5) Emit accepted tokens, then the bonus correction.
+            for t in q[:m]:
+                if emitted >= max_tokens:
+                    return
+                yield t
+                emitted += 1
+                if stats:
+                    stats.tokens_emitted += 1
+                context.append(t)
+                if t == eos_id:
+                    return
+            if emitted >= max_tokens:
+                return
+            yield bonus
+            emitted += 1
+            if stats:
+                stats.tokens_emitted += 1
+            context.append(bonus)
+            if bonus == eos_id:
+                return
+            b = bonus
+    finally:
+        if own_kv:
+            kv.close()
+            tmp.cleanup()
+
+
 def gemma4_mtp_speculative_generate(
     engine: StreamingEngine,
     drafter,
