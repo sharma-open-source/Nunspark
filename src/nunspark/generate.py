@@ -252,8 +252,12 @@ def speculative_generate(
             if stats:
                 stats.draft_tokens_proposed += K
 
-            # 2) Verify [b, q0..q_{K-1}] in one target sweep -> K+1 logit rows.
-            vlog = engine.forward(mx.array([b] + q)[None], kv=kv)
+            # 2) Verify [b, q0..q_{K-1}] in one EPHEMERAL target sweep -> K+1
+            #    logit rows. verify_forward never mutates the persistent kv:
+            #    trim-based rollback is unsound for RotatingKVCache (sliding-
+            #    window archs like gpt-oss) once it has rotated, so rejected
+            #    tokens are simply never committed instead of trimmed away.
+            vlog, recs = engine.verify_forward(mx.array([b] + q)[None], kv)
             targ = mx.argmax(vlog[0], axis=-1).tolist()   # len K+1; targ[i] = argmax after position i
             if stats:
                 stats.target_passes += 1
@@ -282,9 +286,12 @@ def speculative_generate(
                 stats.accepted_total += m
             bonus = int(targ[m])   # correct token after last accepted (m <= K, len(targ)=K+1)
 
-            # 4) Roll back the rejected tail in both caches.
-            #    Target cached b+q0..q_{K-1} (K+1 beyond prompt); keep b+q0..q_{m-1}.
-            kv.truncate(K - m)
+            # 4) Commit the accepted prefix [b, q0..q_{m-1}] (m+1 tokens) to the
+            #    persistent target kv — the bonus becomes the next round's
+            #    bootstrap and enters the cache on that pass. Then roll back the
+            #    rejected tail in the DRAFT's cache only: the draft is a resident
+            #    dense mlx_lm model whose full-attention KVCache trims exactly.
+            engine.commit_verified(kv, recs, m + 1)
             if m < K:
                 #    Draft cached b+q0..q_{K-2} (K beyond prompt); keep b+q0..q_{m-1}.
                 drop = (K - 1) - m
