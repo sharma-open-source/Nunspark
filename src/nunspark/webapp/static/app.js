@@ -130,6 +130,10 @@ function renderMetrics(m) {
     cells.push(["multiplier", "×" + m.multiplier.toFixed(2)]);
     cells.push(["deviation", (m.deviation_rate || 0).toFixed(3)]);
   }
+  if (m.expert_hit_pct !== undefined) {
+    cells.push(["expert hit", m.expert_hit_pct.toFixed(1) + "%"]);
+    cells.push(["MB/token", (m.mb_per_token || 0).toFixed(2)]);
+  }
   $("metrics").innerHTML = cells.map(([k, v]) => `<div>${k}<br><b>${v}</b></div>`).join("");
 }
 

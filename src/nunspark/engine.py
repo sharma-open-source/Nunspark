@@ -209,6 +209,14 @@ class StreamingEngine:
             io_threads=io_threads, pather=self.store.path_for,
             expert_frac=frac,
         )
+        # RAM-resident fast path: when every streamed piece fits the cache budget
+        # such that the PieceCache never evicts anything, the per-layer mx.eval(h)
+        # syncs — which exist ONLY to materialize a layer's output before its
+        # weights can be evicted — are pure overhead (16+ full pipeline stalls per
+        # token). Computed once here against the SAME byte accounting the cache
+        # uses for eviction, so the predicate can only be True when eviction is
+        # provably impossible; see _compute_fully_resident.
+        self._fully_resident = self._compute_fully_resident(budget_bytes, frac)
         self._prefetch = prefetch
         self._warm_window = max(1, warm_window)
 
@@ -343,6 +351,63 @@ class StreamingEngine:
         """Resolve a single module's quant config (dict or None) from the full
         checkpoint quantization dict, keyed by its FULL model path."""
         return _resolve_module_quant(self._quant, self._base_quant, full_path)
+
+    def _compute_fully_resident(self, budget_bytes: int, expert_frac: float) -> bool:
+        """True iff EVERY streamed piece fits the cache budget such that the
+        PieceCache never evicts anything — making the per-layer mx.eval(h) syncs
+        (whose sole purpose is to materialize a layer before its weights can be
+        evicted) safely skippable.
+
+        Byte accounting matches the cache/pinning exactly, deliberately on the
+        SAFE side: on-disk file size is a conservative upper bound on the
+        materialized nbytes the cache actually counts for eviction (a piece file
+        is its tensor data plus a small safetensors header), so if the file-size
+        sums fit, the nbytes sums the cache compares against fit too -> eviction
+        is provably impossible. Only `layer_*` pieces are counted: they are the
+        only pieces that ever enter the cache (fetched via cache.get) — embed,
+        norm/head and masked_embed are loaded once and stay permanently resident,
+        outside the budget.
+
+        The two-region split is honored rather than approximated. A MoE manifest's
+        expert pieces must fit the expert region's cap (expert_frac*budget) AND its
+        core/dense pieces the main region's remainder (budget - expert cap): once
+        the split is active "fits the total budget" is NOT sufficient for "never
+        evicted", so the predicate is TIGHTENED per region. A dense manifest has no
+        expert pieces, the split never activates, and the main region owns the whole
+        budget — so a single total <= budget check is exact there.
+        """
+        budget = int(budget_bytes)
+        expert_bytes = 0
+        main_bytes = 0
+        for piece in self.manifest.pieces:
+            pid = piece.piece_id
+            if not pid.startswith("layer_"):
+                continue  # embed / norm_head / masked_embed: never cached
+            size = os.stat(self.store.path_for(pid)).st_size
+            if "_expert_" in pid:
+                expert_bytes += size
+            else:
+                main_bytes += size
+        if expert_bytes == 0:
+            # No expert region -> split never activates, main region == whole budget.
+            return main_bytes <= budget
+        expert_budget = int(budget * float(expert_frac))
+        return (expert_bytes <= expert_budget
+                and main_bytes <= budget - expert_budget)
+
+    def _sync_layer(self, h: mx.array) -> mx.array:
+        """Per-layer materialization barrier. Normally forces the lazy graph now
+        so a layer's output exists before the PieceCache may evict that layer's
+        weights (see comment at _scatter_experts). On the RAM-resident fast path
+        (self._fully_resident) nothing is ever evicted, so this sync is skipped and
+        the graph is instead materialized once by the final logits/sampling
+        consumption of each pass. mx.eval is scheduling-only — it never changes
+        numerics — so skipping is bit-identical. Note first-touch materialization
+        on fetch/miss (mx.eval in _materialize / _scatter_experts) is a SEPARATE,
+        always-on force-read and is unaffected by this."""
+        if not self._fully_resident:
+            mx.eval(h)
+        return h
 
     def _slot_class_predicate(self, layer_idx: int):
         """class_predicate for nn.quantize over one layer's compute slot.
@@ -509,7 +574,12 @@ class StreamingEngine:
         else:
             cache = kv.get(layer) if kv is not None else None
         h = self._moe_attn_and_mix(slot, layer, h, mask, cache)
-        mx.eval(h)
+        # Selective-MoE layers already host-sync every layer inside
+        # _moe_attn_and_mix (router `inds.reshape(-1).tolist()` and the
+        # _scatter_experts force-read), so this trailing barrier gains little even
+        # off the fast path; skipping it when fully resident is both safe and
+        # keeps the lazy graph from growing (the router sync caps its depth anyway).
+        self._sync_layer(h)
         return h
 
     def _moe_attn_and_mix(self, slot, layer: int, h, mask, cache):
@@ -612,7 +682,7 @@ class StreamingEngine:
 
             cache = kv.get(layer) if kv is not None else None
             h = self._runner.run(self._lctx, slot, layer, h, masks[layer], cache)
-            mx.eval(h)
+            self._sync_layer(h)
 
         # shared_kv is intra-pass producer->consumer state; dropping it here
         # releases the pinned KV copies. target_kv_states must survive the
@@ -730,7 +800,7 @@ class StreamingEngine:
                 h = self._moe_attn_and_mix(slot, layer, h, mask, ephem)
             else:
                 h = slot(h, mask=mask, cache=ephem)
-            mx.eval(h)
+            self._sync_layer(h)
 
             # [B, kv_heads, prefix_len+d, ...]: arrays for fp16, triples for
             # quantized — tree_map slices both shapes uniformly.
@@ -802,7 +872,7 @@ class StreamingEngine:
                 kv.prefetch(list(range(layer + 1, hi)))
 
             h = self._runner.run(self._lctx, slot, layer, h, masks[layer], rec)
-            mx.eval(h)
+            self._sync_layer(h)
 
         self._lctx.shared_kv.clear()
         h = self._norm(h)
