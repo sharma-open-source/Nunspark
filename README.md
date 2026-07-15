@@ -150,6 +150,10 @@ are written up in [docs/](docs/) gate summaries.
 - **Local web UI** (`nunspark web`) — a FastAPI app for long, document-driven **batch**
   generation (not interactive chat — this engine is seconds-per-token). Upload files, submit a
   batch, get one generation job per file streamed to disk with live progress over SSE.
+  Plain-text uploads only (.txt/.md): PDFs and other binaries are rejected with a clear
+  error — extract the text first. Prompts are also capped against your machine's unified
+  RAM (the KV cache grows ~100 KB/token on a 30B model; an uncapped mega-prompt can
+  swap-storm the whole Mac). Set `advanced.max_prompt_tokens` to override the cap.
 - **Architecture support** — 24 decoder-only model types are registered
   (`src/nunspark/architectures.py`), including Llama, Mistral, Phi-3, Qwen2, Qwen3 (dense +
   MoE via selective expert streaming), Gemma3/Gemma4 (including heterogeneous attention),

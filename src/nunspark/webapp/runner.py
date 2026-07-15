@@ -18,6 +18,159 @@ from .schemas import Job, JobStatus, preset_params
 _METRICS_EVERY = 8
 _KV_BUDGET_BYTES = 1_000_000_000_000
 
+# --- Input guards -----------------------------------------------------------
+# A binary upload (e.g. a PDF) decoded with errors="replace" becomes millions
+# of garbage characters; tokenized, their KV cache alone (~98 KB/token on
+# Qwen3-30B) can exceed machine RAM and swap-storm the whole Mac. So: reject
+# binary files outright, and cap prompt tokens against unified memory.
+
+# PDF is called out separately because it is the common accidental upload.
+_PDF_MAGIC = b"%PDF"
+_BINARY_MAGICS: tuple[bytes, ...] = (
+    b"PK\x03\x04",  # zip (also docx/xlsx/pptx)
+    b"\x89PNG",
+    b"\xff\xd8",    # jpeg
+    b"GIF8",
+    b"\x7fELF",
+)
+_NUL_SCAN_BYTES = 8 * 1024
+# Real text has essentially zero U+FFFD; 5% means the bytes are not UTF-8.
+_REPLACEMENT_RATIO_MAX = 0.05
+
+_PROMPT_CAP_MIN = 4096
+_PROMPT_CAP_MAX = 65536
+# Used when RAM or model geometry can't be determined -- conservative but
+# enough for typical documents.
+_PROMPT_CAP_FALLBACK = 8192
+# Left out of the KV budget for the OS, activations, and everything else.
+_PROMPT_CAP_HEADROOM_BYTES = 4 * 1024**3
+
+
+def _read_file_text(path: Path) -> str:
+    """Read an upload as text, rejecting binary files loudly.
+
+    Reads bytes first so binary content is caught before errors="replace"
+    can turn it into garbage that looks like a (huge) valid prompt.
+    """
+    raw = path.read_bytes()
+
+    if raw.startswith(_PDF_MAGIC):
+        raise ValueError(
+            "PDF files are not supported — extract the text first "
+            "and upload it as .txt/.md"
+        )
+
+    if raw.startswith(_BINARY_MAGICS):
+        raise ValueError(
+            "binary file detected — upload plain text (.txt/.md) instead"
+        )
+
+    if b"\x00" in raw[:_NUL_SCAN_BYTES]:
+        raise ValueError(
+            "binary file detected (NUL bytes) — upload plain text "
+            "(.txt/.md) instead"
+        )
+
+    text = raw.decode("utf-8", errors="replace")
+
+    if text and text.count("�") / len(text) > _REPLACEMENT_RATIO_MAX:
+        raise ValueError(
+            "file does not decode as UTF-8 text (>5% invalid characters) "
+            "— upload plain text (.txt/.md) instead"
+        )
+
+    return text
+
+
+def _arg_int(args: Any, *names: str) -> int | None:
+    """First integer attribute (or dict key) among `names`, else None.
+
+    The isinstance check guards against Mock objects and non-numeric config
+    values sneaking into the KV-size arithmetic.
+    """
+    for name in names:
+        value = getattr(args, name, None)
+        if value is None and isinstance(args, dict):
+            value = args.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _per_token_kv_bytes(engine: Any) -> int | None:
+    """Estimated fp16 KV-cache bytes per prompt token, or None if the model
+    geometry can't be read off the engine's args."""
+    args = getattr(engine, "args", None)
+    if args is None:
+        return None
+
+    layers = _arg_int(args, "num_hidden_layers")
+    heads = _arg_int(args, "num_key_value_heads", "num_attention_heads")
+    head_dim = _arg_int(args, "head_dim")
+
+    if head_dim is None:
+        hidden = _arg_int(args, "hidden_size")
+        attn_heads = _arg_int(args, "num_attention_heads")
+        if hidden is not None and attn_heads:
+            head_dim = hidden // attn_heads
+
+    if layers is None or heads is None or head_dim is None:
+        return None
+
+    # K and V, 2 bytes each (fp16) -- ignores kv_bits quantization on
+    # purpose: the cap should hold even for the unquantized worst case.
+    return layers * heads * head_dim * 2 * 2
+
+
+def _unified_ram_bytes() -> int | None:
+    """Unified memory size via Metal; None when unavailable (non-macOS, CI)."""
+    try:
+        size = mx.metal.device_info().get("memory_size")
+        return int(size) if size else None
+    except Exception:
+        return None
+
+
+def _check_prompt_cap(
+    prompt_len: int,
+    *,
+    engine: Any,
+    budget_bytes: int,
+    advanced: dict[str, Any],
+) -> None:
+    """Fail loudly (never truncate) when the prompt's KV cache can't fit.
+
+    `advanced.max_prompt_tokens` overrides the derived cap entirely, so a
+    user who understands the swap risk is never blocked.
+    """
+    override = advanced.get("max_prompt_tokens")
+    per_token = _per_token_kv_bytes(engine)
+    ram = _unified_ram_bytes()
+
+    if override is not None:
+        cap = int(override)
+    elif per_token is None or ram is None:
+        cap = _PROMPT_CAP_FALLBACK
+    else:
+        allowed = (ram - budget_bytes - _PROMPT_CAP_HEADROOM_BYTES) // per_token
+        cap = max(_PROMPT_CAP_MIN, min(_PROMPT_CAP_MAX, int(allowed)))
+
+    if prompt_len <= cap:
+        return
+
+    message = f"prompt is {prompt_len} tokens, over the cap of {cap}"
+
+    if per_token is not None and ram is not None:
+        message += (
+            f": its KV cache alone would need "
+            f"~{prompt_len * per_token / 1e9:.1f} GB "
+            f"against {ram / 1e9:.0f} GB unified RAM"
+        )
+
+    message += "; set advanced.max_prompt_tokens to override"
+
+    raise ValueError(message)
+
 
 def build_prompt(
     instruction: str,
@@ -123,6 +276,10 @@ def run_generation(
                 tempfile.TemporaryDirectory(prefix="nunspark_web_kv_")
             )
 
+            # Before acquiring an engine: a rejected upload should not cost
+            # a (potentially multi-GB) model load.
+            file_text = _read_file_text(Path(job.file_path))
+
             handle = pool.acquire(
                 job.model,
                 job.draft,
@@ -134,11 +291,6 @@ def run_generation(
             tokenizer = handle.tokenizer
             draft_model = handle.draft_model
 
-            file_text = Path(job.file_path).read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-
             prompt = build_prompt(
                 job.instruction,
                 file_text,
@@ -148,6 +300,13 @@ def run_generation(
 
             if isinstance(prompt, str):
                 prompt = tokenizer.encode(prompt)
+
+            _check_prompt_cap(
+                len(prompt),
+                engine=engine,
+                budget_bytes=budget,
+                advanced=advanced,
+            )
 
             eos = getattr(tokenizer, "eos_token_id", None)
 

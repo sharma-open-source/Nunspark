@@ -11,7 +11,7 @@ from mlx.utils import tree_flatten
 from .manifest import Manifest
 from .packer import pack as pack_model
 from .engine import StreamingEngine
-from .generate import generate as run_generate
+from .generate import generate as run_generate, PREFILL_CHUNK
 from .server import run_server
 
 _UNITS = [("TB", 1000**4), ("GB", 1000**3), ("MB", 1000**2), ("KB", 1000),
@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Number of draft tokens to propose per iteration (default: 16)")
     p_gen.add_argument("--accept-top-k", type=int, default=1,
                        help="Acceptance threshold: 1=lossless, >1=fast mode (default: 1)")
+    p_gen.add_argument("--prefill-chunk", type=int, default=PREFILL_CHUNK,
+                       help="prompt tokens prefilled per forward window; smaller caps "
+                            "peak activation memory on long prompts (default: "
+                            f"{PREFILL_CHUNK})")
     p_gen.add_argument("--no-chat-template", action="store_true",
                        help="skip chat template; encode prompt as-is (default: apply if available)")
     p_gen.add_argument("--metrics", action="store_true",
@@ -382,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                         max_tokens=args.max_tokens,
                         kv=kv, eos_id=eos, stats=spec_stats,
                         kv_quant=kv_quant,
+                        prefill_chunk=args.prefill_chunk,
                     )
                 elif eagle_drafter is not None:
                     from .generate import eagle_speculative_generate
@@ -411,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                         accept_top_k=args.accept_top_k,
                         kv=kv, eos_id=eos, stats=spec_stats,
                         kv_quant=kv_quant,
+                        prefill_chunk=args.prefill_chunk,
                     )
                 else:
                     from .generate import stream_generate
@@ -419,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
                         max_tokens=args.max_tokens, temp=args.temp,
                         kv=kv,
                         kv_quant=kv_quant,
+                        prefill_chunk=args.prefill_chunk,
                     )
 
                 # Decode + print on a background thread so terminal I/O does

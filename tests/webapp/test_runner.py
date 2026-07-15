@@ -156,3 +156,148 @@ def test_run_generation_bad_output_dir_does_not_raise(tmp_path, tiny_packed_dir)
         pool.close()
     assert job.status == JobStatus.ERROR
     assert events[-1]["type"] == "error"
+
+
+# --- Input guards (binary rejection + prompt-token cap) ----------------------
+# These use MagicMock(spec=EnginePool) like the release-regression test above,
+# so we can assert the pool (and thus the model / generate) is never touched
+# for a rejected upload.
+
+def _guard_job(tmp_path, data: bytes, advanced=None, **overrides):
+    src = tmp_path / overrides.pop("file_name", "upload.bin")
+    src.write_bytes(data)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    return Job(
+        id="jg", batch_id="b1", file_name=src.name, file_path=str(src),
+        model="/nonexistent/model", use_chat_template=False,
+        max_tokens=4, output_dir=str(out_dir),
+        advanced=advanced or {"budget": "4GB"}, **overrides,
+    )
+
+
+def test_run_generation_rejects_pdf(tmp_path):
+    job = _guard_job(tmp_path, b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nbinary body",
+                     file_name="doc.pdf")
+    pool = MagicMock(spec=EnginePool)
+    events = []
+    run_generation(job, pool=pool, emit=lambda e: events.append(e),
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "PDF" in job.error
+    assert ".txt/.md" in job.error
+    pool.acquire.assert_not_called()  # generate never reached
+    assert events[-1]["type"] == "error"
+
+
+def test_run_generation_rejects_nul_binary(tmp_path):
+    job = _guard_job(tmp_path, b"MZ\x90\x00\x03binary\x00tail")
+    pool = MagicMock(spec=EnginePool)
+    run_generation(job, pool=pool, emit=lambda e: None,
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "binary" in job.error
+    pool.acquire.assert_not_called()
+
+
+def test_run_generation_rejects_high_replacement_ratio(tmp_path):
+    # No magic, no NUL bytes -- but >5% of the decoded text is U+FFFD.
+    job = _guard_job(tmp_path, b"hello " + b"\xfe\xfb" * 4096)
+    pool = MagicMock(spec=EnginePool)
+    run_generation(job, pool=pool, emit=lambda e: None,
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "UTF-8" in job.error
+    pool.acquire.assert_not_called()
+
+
+def _mock_pool_with_prompt(num_tokens: int, engine=None):
+    """Pool whose engine tokenizes any text to `num_tokens` ids -- lets the
+    cap tests exercise huge prompts without a real tokenizer."""
+    handle = MagicMock()
+    handle.tokenizer.encode.return_value = list(range(num_tokens))
+    handle.draft_model = None
+    if engine is not None:
+        handle.engine = engine
+    pool = MagicMock(spec=EnginePool)
+    pool.acquire.return_value = handle
+    return pool
+
+
+def test_run_generation_prompt_cap_override_exceeded(tmp_path):
+    job = _guard_job(tmp_path, b"plain text body",
+                     advanced={"budget": "4GB", "max_prompt_tokens": 128})
+    pool = _mock_pool_with_prompt(50_000)
+    run_generation(job, pool=pool, emit=lambda e: None,
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "50000" in job.error and "128" in job.error
+    assert "max_prompt_tokens" in job.error
+
+
+def test_run_generation_prompt_cap_override_high_passes(tmp_path, tiny_packed_dir):
+    src = tmp_path / "doc.txt"
+    src.write_text("Hello world. This is a test document.")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    job = Job(
+        id="j6", batch_id="b1", file_name="doc.txt", file_path=str(src),
+        model=str(tiny_packed_dir), use_chat_template=False,
+        max_tokens=4, output_dir=str(out_dir),
+        advanced={"budget": "4GB", "max_prompt_tokens": 100_000},
+    )
+    pool = EnginePool()
+    try:
+        run_generation(job, pool=pool, emit=lambda e: None,
+                       should_cancel=lambda: False)
+    finally:
+        pool.close()
+    assert job.status == JobStatus.DONE
+    assert job.error is None
+
+
+def _qwen30b_like_args():
+    from types import SimpleNamespace
+    # 48 layers x 4 KV heads x 128 head_dim x 4 bytes = 98304 B/token,
+    # matching the ~98 KB/token Qwen3-30B figure the guard exists for.
+    return SimpleNamespace(
+        num_hidden_layers=48, num_key_value_heads=4,
+        num_attention_heads=32, head_dim=128, hidden_size=4096,
+    )
+
+
+def test_run_generation_derived_cap_arithmetic(tmp_path, monkeypatch):
+    from nunspark.webapp import runner as runner_mod
+
+    per_token = 48 * 4 * 128 * 4
+    budget = runner_mod._parse_size("4GB")
+    # RAM sized so (ram - budget - headroom) / per_token == 10_000 exactly,
+    # inside the [4096, 65536] clamp window.
+    ram = budget + runner_mod._PROMPT_CAP_HEADROOM_BYTES + per_token * 10_000
+    monkeypatch.setattr(runner_mod, "_unified_ram_bytes", lambda: ram)
+
+    engine = MagicMock()
+    engine.args = _qwen30b_like_args()
+    job = _guard_job(tmp_path, b"plain text body")
+    pool = _mock_pool_with_prompt(10_001, engine=engine)
+    run_generation(job, pool=pool, emit=lambda e: None,
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "10001" in job.error and "10000" in job.error
+    assert "GB unified RAM" in job.error
+
+
+def test_run_generation_derived_cap_clamps_to_min(tmp_path, monkeypatch):
+    from nunspark.webapp import runner as runner_mod
+
+    # RAM below budget + headroom -> raw allowance is negative -> min clamp.
+    monkeypatch.setattr(runner_mod, "_unified_ram_bytes", lambda: 6 * 1024**3)
+
+    engine = MagicMock()
+    engine.args = _qwen30b_like_args()
+    job = _guard_job(tmp_path, b"plain text body")
+    pool = _mock_pool_with_prompt(5_000, engine=engine)
+    run_generation(job, pool=pool, emit=lambda e: None,
+                   should_cancel=lambda: False)
+    assert job.status == JobStatus.ERROR
+    assert "5000" in job.error and "4096" in job.error
