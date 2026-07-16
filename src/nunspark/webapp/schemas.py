@@ -43,7 +43,7 @@ def preset_params(
 class Advanced(BaseModel):
     kv_bits: int | None = None
     kv_group_size: int = 64
-    budget: str = "4GB"
+    budget: str = "auto"
     accept_top_k: int | None = None
     num_draft_tokens: int | None = None
     # Explicit override for the RAM-derived prompt-token cap in the runner.

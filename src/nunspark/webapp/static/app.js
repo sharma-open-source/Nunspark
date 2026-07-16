@@ -56,7 +56,7 @@ async function upload(fileList) {
 $("run").onclick = async () => {
   if (!uploaded.length) return alert("Upload at least one file.");
   const advanced = {
-    budget: $("budget").value || "4GB",
+    budget: $("budget").value || "auto",
     kv_bits: $("kv-bits").value ? Number($("kv-bits").value) : null,
     accept_top_k: $("accept-top-k").value ? Number($("accept-top-k").value) : null,
     num_draft_tokens: $("num-draft-tokens").value ? Number($("num-draft-tokens").value) : null,

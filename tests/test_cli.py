@@ -90,6 +90,10 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
     packed = tmp_path / "packed"
     assert main(["pack", str(tiny_model_dir), str(packed)]) == 0
 
+    # --budget now defaults to "auto" (derived from unified RAM); pin RAM so
+    # the resolved byte count is deterministic: 16 GiB -> 8 GiB budget.
+    monkeypatch.setattr("nunspark.sysmem.unified_ram_bytes", lambda: 16 * 2**30)
+
     calls = []
     monkeypatch.setattr(
         "nunspark.cli.run_server",
@@ -101,7 +105,7 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
     assert (packed_dir, host, port) == (str(packed), "127.0.0.1", 8080)
     assert kwargs == {
         "model_name": None,
-        "budget_bytes": 4_000_000_000,
+        "budget_bytes": 8 * 2**30,
         "kv_budget": 10**12,
         "prefetch": True,
         "io_threads": 1,

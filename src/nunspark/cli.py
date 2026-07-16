@@ -13,6 +13,7 @@ from .packer import pack as pack_model
 from .engine import StreamingEngine
 from .generate import generate as run_generate, PREFILL_CHUNK
 from .server import run_server
+from .sysmem import auto_budget_bytes, resolve_budget as _resolve_budget
 
 _UNITS = [("TB", 1000**4), ("GB", 1000**3), ("MB", 1000**2), ("KB", 1000),
           ("T", 1000**4), ("G", 1000**3), ("M", 1000**2), ("K", 1000), ("B", 1)]
@@ -48,8 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--prompt-ids", default=None, help="comma-separated token ids (alternative to --prompt)")
     p_gen.add_argument("--max-tokens", type=int, default=32)
     p_gen.add_argument("--temp", type=float, default=0.0)
-    p_gen.add_argument("--budget", default="4GB",
-                       help="resident weight budget, e.g. 512MB, 4GB")
+    p_gen.add_argument("--budget", default="auto",
+                       help='resident weight budget, e.g. 512MB, 8GB, or "auto" '
+                            '(default: 75% of RAM minus 4GB)')
     p_gen.add_argument("--no-prefetch", action="store_true",
                        help="disable background prefetch overlap")
     p_gen.add_argument("--io-threads", type=int, default=1,
@@ -107,8 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--model-name", default=None,
                          help="model id reported to clients (defaults to the packed dir's name)")
-    p_serve.add_argument("--budget", default="4GB",
-                         help="resident weight budget, e.g. 512MB, 4GB")
+    p_serve.add_argument("--budget", default="auto",
+                         help='resident weight budget, e.g. 512MB, 8GB, or "auto" '
+                              '(default: 75% of RAM minus 4GB)')
     p_serve.add_argument("--no-prefetch", action="store_true",
                          help="disable background prefetch overlap")
     p_serve.add_argument("--io-threads", type=int, default=1,
@@ -156,8 +159,9 @@ def build_parser() -> argparse.ArgumentParser:
                               "(n-gram) drafter instead of a draft model (mode 'ngram-spec'); "
                               "uses --draft-tokens as K, no draft download")
     p_bench.add_argument("--draft-tokens", type=int, default=24)
-    p_bench.add_argument("--budget", default="8GB",
-                         help="PieceCache byte budget, e.g. 512MB, 8GB (default 8GB)")
+    p_bench.add_argument("--budget", default="auto",
+                         help='PieceCache byte budget, e.g. 512MB, 8GB, or "auto" '
+                              '(default: 75% of RAM minus 4GB)')
     p_bench.add_argument("--max-tokens", type=int, default=100)
     p_bench.add_argument("--out", default=None, help="optional path to write raw JSON results")
     p_bench.add_argument("--quick", action="store_true",
@@ -186,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest = Manifest.load(Path(args.packed_dir) / "manifest.json")
         engine = StreamingEngine(
             args.packed_dir, manifest,
-            budget_bytes=_parse_size(args.budget),
+            budget_bytes=_resolve_budget(args.budget),
             prefetch=not args.no_prefetch,
             io_threads=args.io_threads,
             warm_window=args.warm_window,
@@ -475,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.metrics:
             peak_gb = mx.get_peak_memory() / 1e9
-            budget_bytes = _parse_size(args.budget)
+            budget_bytes = _resolve_budget(args.budget)
             total_model_gb = sum(
                 f.stat().st_size for f in Path(args.packed_dir).glob("*.safetensors")
             ) / 1e9
@@ -509,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
             run_server(
                 args.packed_dir, args.host, args.port,
                 model_name=args.model_name,
-                budget_bytes=_parse_size(args.budget),
+                budget_bytes=_resolve_budget(args.budget),
                 kv_budget=_parse_size(args.kv_budget),
                 prefetch=not args.no_prefetch,
                 io_threads=args.io_threads,
@@ -567,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         out_path = Path(args.out) if args.out else None
         results = run_bench(
             packed_dir, draft=draft, draft_tokens=args.draft_tokens,
-            budget=_parse_size(args.budget), max_tokens=max_tokens,
+            budget=_resolve_budget(args.budget), max_tokens=max_tokens,
             workloads=workloads, out=out_path, ngram=ngram,
         )
 

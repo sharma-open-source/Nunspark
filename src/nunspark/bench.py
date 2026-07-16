@@ -342,7 +342,11 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
         if budget_bytes is None:
             budget_bytes = r.get("budget_bytes")
 
-    budget_str = f"{budget_bytes / 1e9:.0f}GB" if budget_bytes else "unknown"
+    if budget_bytes:
+        budget_gb = budget_bytes / 1e9
+        budget_str = f"{budget_gb:.0f}GB" if budget_gb == int(budget_gb) else f"{budget_gb:.1f}GB"
+    else:
+        budget_str = "unknown"
     settings = f"settings: budget={budget_str}"
     if results:
         max_tokens = max((r.get("tokens_generated", 0) for r in results), default=None)
