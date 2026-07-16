@@ -12,6 +12,8 @@ import mlx.core as mx
 from ..archspec import KVQuant
 from ..generate import SpecStats, speculative_generate, stream_generate
 from ..kv_store import KVStore
+from ..sysmem import resolve_budget
+from ..sysmem import unified_ram_bytes as _unified_ram_bytes
 from .engine_pool import EnginePool
 from .schemas import Job, JobStatus, preset_params
 
@@ -120,15 +122,6 @@ def _per_token_kv_bytes(engine: Any) -> int | None:
     # K and V, 2 bytes each (fp16) -- ignores kv_bits quantization on
     # purpose: the cap should hold even for the unquantized worst case.
     return layers * heads * head_dim * 2 * 2
-
-
-def _unified_ram_bytes() -> int | None:
-    """Unified memory size via Metal; None when unavailable (non-macOS, CI)."""
-    try:
-        size = mx.metal.device_info().get("memory_size")
-        return int(size) if size else None
-    except Exception:
-        return None
 
 
 def _check_prompt_cap(
@@ -247,7 +240,7 @@ def run_generation(
 
     advanced = job.advanced or {}
 
-    budget = _parse_size(advanced.get("budget", "4GB"))
+    budget = resolve_budget(advanced.get("budget", "auto"))
     kv_quant = _kv_quant(advanced)
 
     accept_top_k, num_draft = preset_params(

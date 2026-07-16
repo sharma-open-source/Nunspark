@@ -10,9 +10,61 @@ show `—`.
 
 ---
 
-## mlx-community/gpt-oss-120b-4bit (MoE, 36L x 128 experts, 4 fired)
+## mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit (MoE, 62L x 160 experts, 8 fired)
 
-### Apple M1 Max, 64 GB RAM, macOS 26.5.2 — nunspark 0.5.0, mlx 0.32.0 (2026-07-15)
+### Apple M5 Max, 128 GB RAM, macOS 26.5 — nunspark 0.7.0, mlx 0.32.0 (2026-07-16)
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 0.09 | — | 63.4 | 5325 | 98.58 |
+| code | spec | 0.11 | 5.00 | 38.9 | 29406 | 99.20 |
+| prose | greedy | 0.17 | — | 82.0 | 2655 | 98.59 |
+| prose | spec | 0.07 | 2.17 | 49.8 | 29654 | 99.19 |
+| reasoning | greedy | 0.12 | — | 74.3 | 3835 | 98.61 |
+| reasoning | spec | 0.08 | 2.86 | 39.6 | 39039 | 99.26 |
+
+settings: budget=90GB, max_tokens<=100, speculative=on, K=24 (default Qwen3-0.6B draft)
+
+Notes:
+- Largest model run to date: ~270 GB pack on 128 GB RAM (~2.1x over-commit) —
+  **runs correctly but is capacity-bound**, 0.09–0.17 tok/s greedy at 2.7–5.3
+  GB/token of expert reads. Same structural regime as gpt-oss-120b on 16 GB:
+  the 90 GB budget covers roughly a third of the expert pool, so miss volume
+  dominates.
+- Spec arm reconfirms the MoE verify-union tax at the largest scale yet
+  (backlog #5): K=24 blows expert reads to 29–39 GB/token and halves the hit
+  rate (82→50, 74→40, 63→39). Code's M=5.00 still only manages 0.11 vs 0.09
+  greedy — the union tax eats the entire acceptance win. Third independent
+  dataset (local 30B, community 120B, now 480B) all pointing at defaulting the
+  spec arm OFF (or small-K `--ngram`) for MoE manifests.
+- Interesting inversion vs smaller MoEs: prose is the *fastest* workload here
+  (highest expert reuse, 82% hit), while code is slowest — expert diversity on
+  code prompts is brutal at 160 experts/layer.
+
+## mlx-community/gpt-oss-120b-MXFP4-Q8 (MoE, 36L x 128 experts, 4 fired)
+
+### Apple M5 Max, 128 GB RAM, macOS 26.5 — nunspark 0.7.0, mlx 0.32.0 (2026-07-16)
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 0.84 | — | 67.2 | 749 | 28.76 |
+| code | spec | 0.51 | 1.12 | 81.5 | 1927 | 28.91 |
+| prose | greedy | 1.31 | — | 74.5 | 587 | 28.77 |
+| prose | spec | 0.61 | 1.52 | 69.9 | 2474 | 28.92 |
+| reasoning | greedy | 0.97 | — | 69.6 | 704 | 28.79 |
+| reasoning | spec | 0.50 | 1.01 | 86.0 | 1335 | 28.94 |
+
+settings: budget=24GB, max_tokens<=100, speculative=on, K=24 (default Qwen3-0.6B draft)
+
+Notes:
+- Same volunteer as the 480B run above. Different checkpoint variant than the M1 Max
+  run below (MXFP4-**Q8** vs 4bit — larger expert bytes per miss).
+- Budget deliberately small (24 GB on a 128 GB machine): greedy 0.84–1.31 tok/s at
+  67–75% expert hit, vs the 64 GB volunteer's 1.65–1.96 at ~80% hit with budget=58GB.
+  Consistent picture: on this model tok/s tracks expert cache coverage almost
+  directly — a 58GB+ budget on this machine should meet or beat the M1 Max numbers.
+- Spec arm loses again (fourth dataset): M=1.01–1.52 (tokenizer mismatch → mostly
+  bonus-token) while verify-union reads run 1.3–2.5 GB/token. Reinforces backlog #5.
 
 | workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
 |---|---|---|---|---|---|---|

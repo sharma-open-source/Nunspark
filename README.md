@@ -245,7 +245,7 @@ Key flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`). Lower = more disk reads, less RAM. |
+| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`, or `auto`). Lower = more disk reads, less RAM. Default is now `auto` (75% of RAM minus 4GB); the community numbers below were all run with an explicit `--budget`, so pin one yourself for comparable results. |
 | `--kv-budget` | Resident KV-cache budget (default: unbounded). |
 | `--kv-bits {4,8}` | Quantize the KV cache (default fp16). |
 | `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations)). |

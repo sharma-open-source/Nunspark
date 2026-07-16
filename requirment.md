@@ -10,7 +10,6 @@ The core idea is split the models into small small pieces and load only require 
 In reality this was not possible at all; tried with 70b modal on 16gb ram m4 system;
 got around ~0.6-8 token/s which means for 500 token we need to wait around 15 minuts.
 
-operation success but patient died :-)
 ------
 
 5th Jun 2026: update
