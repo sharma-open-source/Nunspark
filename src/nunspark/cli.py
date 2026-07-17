@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "Mutually exclusive with --draft-model / --eagle-drafter")
     p_gen.add_argument("--ngram-max", type=int, default=3,
                        help="longest suffix n-gram tried by --ngram-draft (default: 3)")
+    p_gen.add_argument("--no-ngram-adaptive", dest="ngram_adaptive",
+                       action="store_false", default=True,
+                       help="disable adaptive proposal-length shrink/grow for "
+                            "--ngram-draft; always propose the fixed --num-draft-tokens "
+                            "(default: adaptive on)")
     p_gen.add_argument("--num-draft-tokens", type=int, default=16,
                        help="Number of draft tokens to propose per iteration (default: 16)")
     p_gen.add_argument("--accept-top-k", type=int, default=1,
@@ -159,6 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "(n-gram) drafter instead of a draft model (mode 'ngram-spec'); "
                               "uses --draft-tokens as K, no draft download")
     p_bench.add_argument("--draft-tokens", type=int, default=24)
+    p_bench.add_argument("--no-ngram-adaptive", dest="ngram_adaptive",
+                         action="store_false", default=True,
+                         help="disable adaptive proposal-length shrink/grow for --ngram "
+                              "(default: adaptive on)")
     p_bench.add_argument("--budget", default="auto",
                          help='PieceCache byte budget, e.g. 512MB, 8GB, or "auto" '
                               '(default: 75% of RAM minus 4GB)')
@@ -242,9 +251,11 @@ def main(argv: list[str] | None = None) -> int:
                 ngram_drafter = NGramDrafter(
                     max_ngram=args.ngram_max,
                     num_draft_tokens=args.num_draft_tokens,
+                    adaptive=args.ngram_adaptive,
                 )
                 print(f"  n-gram drafter (max_ngram={args.ngram_max}, "
-                      f"K={args.num_draft_tokens})", file=sys.stderr)
+                      f"K={args.num_draft_tokens}, "
+                      f"adaptive={args.ngram_adaptive})", file=sys.stderr)
 
             # Load EAGLE drafter if provided (feature-level speculation)
             eagle_drafter = None
@@ -573,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
             packed_dir, draft=draft, draft_tokens=args.draft_tokens,
             budget=_resolve_budget(args.budget), max_tokens=max_tokens,
             workloads=workloads, out=out_path, ngram=ngram,
+            ngram_adaptive=args.ngram_adaptive,
         )
 
         info = system_info()

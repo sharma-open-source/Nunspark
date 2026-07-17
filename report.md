@@ -394,7 +394,9 @@ models, both shipped in release 0.5.0:
    (per-layer ephemeral cache clones) + `commit_verified`
    (append-only accepted rows) across both `speculative_generate` and
    `ngram_speculative_generate`. 235 tests pass; gpt-oss regressions
-   are bit-identical to greedy past rotation.
+   verify target-argmax lossless acceptance past rotation (not guaranteed
+   byte-identical to greedy at model scale -- see
+   docs/plan5-m2-mismatch-investigation.md).
 
 Both fixes were field-validated: the same volunteer who hit the
 sliding-window crash on the pre-0.5.0 release confirmed it gone on

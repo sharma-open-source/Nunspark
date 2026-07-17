@@ -185,7 +185,13 @@ def tree_speculative_generate(
     Each round: re-prefill the draft over the committed sequence, fill `shape`, verify
     every root-to-leaf path in ONE target sweep, run SpecInfer rejection sampling to
     pick the accepted path, commit its KV, and emit accepted tokens + a bonus. At
-    `temp == 0` output is bit-identical to greedy `generate()`. KV lifecycle matches
+    `temp == 0`, output is target-verified and lossless-by-construction: every emitted
+    token is the target's own argmax from a verification pass, deterministic for a
+    given config. Note: not guaranteed byte-identical to single-token greedy
+    `generate()` on large real models -- a multi-token verify pass computes fp16
+    numerics under different kernel shapes, and rare argmax near-tie flips (~1/100
+    tokens, self-healing, see docs/plan5-m2-mismatch-investigation.md) can occur;
+    tiny-fixture tests are exactly bit-identical. KV lifecycle matches
     `speculative_generate`: pass `kv` to borrow a store, else one is created/disposed.
     """
     own_kv = kv is None

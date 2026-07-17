@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from nunspark.webapp.engine_pool import EnginePool
-from nunspark.webapp.runner import build_prompt, run_generation
+from nunspark.webapp.runner import build_prompt, run_generation, run_generation_batch
 from nunspark.webapp.schemas import Job, JobStatus
 
 
@@ -285,6 +285,170 @@ def test_run_generation_derived_cap_arithmetic(tmp_path, monkeypatch):
     assert job.status == JobStatus.ERROR
     assert "10001" in job.error and "10000" in job.error
     assert "GB unified RAM" in job.error
+
+
+# --- Plan 5 M3b-3: batch dispatcher runner (run_generation_batch) ------------
+
+def _batch_job(tmp_path, out_dir, jid, text, **overrides):
+    src = tmp_path / f"{jid}.txt"
+    src.write_text(text)
+    return Job(
+        id=jid, batch_id="b1", file_name=f"{jid}.txt", file_path=str(src),
+        use_chat_template=False, max_tokens=4, temperature=0.0,
+        output_dir=str(out_dir), advanced={"budget": "4GB"}, **overrides,
+    )
+
+
+def test_run_generation_batch_calls_batched_generate_once(tmp_path, tiny_packed_dir, monkeypatch):
+    """A compatible group of jobs must ride ONE batched_generate() call with
+    N prompts, not N calls to generate()."""
+    from nunspark.webapp import runner as runner_mod
+
+    calls = []
+
+    def fake_batched_generate(engine, prompts, **kwargs):
+        calls.append(prompts)
+        return [[7, 8] for _ in prompts]
+
+    monkeypatch.setattr(runner_mod, "batched_generate", fake_batched_generate)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    jobs = [
+        _batch_job(tmp_path, out_dir, f"j{i}", f"Hello world {i}.",
+                   model=str(tiny_packed_dir))
+        for i in range(3)
+    ]
+
+    events = []
+    pool = EnginePool()
+    try:
+        run_generation_batch(jobs, pool=pool,
+                              emit=lambda jid, e: events.append((jid, e)),
+                              should_cancel=lambda jid: False)
+    finally:
+        pool.close()
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 3
+    for job in jobs:
+        assert job.status == JobStatus.DONE
+        assert job.metrics["batched"] is True
+        assert job.metrics["batch_size"] == 3
+    assert any(e["type"] == "done" for _, e in events)
+
+
+def test_run_generation_batch_group_of_one_uses_sequential(tmp_path, tiny_packed_dir):
+    """A group of a single job gets no benefit from batching -- it must take
+    the ordinary sequential generate() path (no `batched` metrics field)."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    job = _batch_job(tmp_path, out_dir, "j1", "Hello world.", model=str(tiny_packed_dir))
+
+    events = []
+    pool = EnginePool()
+    try:
+        run_generation_batch([job], pool=pool,
+                              emit=lambda jid, e: events.append((jid, e)),
+                              should_cancel=lambda jid: False)
+    finally:
+        pool.close()
+
+    assert job.status == JobStatus.DONE
+    assert "batched" not in job.metrics
+
+
+def test_run_generation_batch_falls_back_when_batched_generate_raises(
+    tmp_path, tiny_packed_dir, monkeypatch,
+):
+    """If batched_generate() itself raises (e.g. a sliding-window arch slipped
+    through the group-compatibility check upstream), the group must fall back
+    to running sequentially rather than failing every job in it."""
+    from nunspark.webapp import runner as runner_mod
+
+    def boom(*a, **k):
+        raise ValueError("sliding-window unsupported")
+
+    monkeypatch.setattr(runner_mod, "batched_generate", boom)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    jobs = [
+        _batch_job(tmp_path, out_dir, f"j{i}", f"Hello world {i}.",
+                   model=str(tiny_packed_dir))
+        for i in range(2)
+    ]
+
+    events = []
+    pool = EnginePool()
+    try:
+        run_generation_batch(jobs, pool=pool,
+                              emit=lambda jid, e: events.append((jid, e)),
+                              should_cancel=lambda jid: False)
+    finally:
+        pool.close()
+
+    for job in jobs:
+        assert job.status == JobStatus.DONE
+        assert job.error is None
+        assert "batched" not in job.metrics
+
+
+def test_run_generation_batch_isolates_bad_upload(tmp_path, tiny_packed_dir):
+    """A single bad upload in a group of 2 errors on its own job; the group
+    shrinks to a survivor of 1 and still completes via the sequential path."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    good = _batch_job(tmp_path, out_dir, "good", "Hello world.", model=str(tiny_packed_dir))
+    bad = _batch_job(tmp_path, out_dir, "bad", "placeholder", model=str(tiny_packed_dir))
+    Path(bad.file_path).write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nbinary body")
+
+    events = []
+    pool = EnginePool()
+    try:
+        run_generation_batch([bad, good], pool=pool,
+                              emit=lambda jid, e: events.append((jid, e)),
+                              should_cancel=lambda jid: False)
+    finally:
+        pool.close()
+
+    assert bad.status == JobStatus.ERROR
+    assert "PDF" in bad.error
+    assert good.status == JobStatus.DONE
+    assert good.error is None
+
+
+def test_run_generation_batch_isolates_bad_upload_with_batched_survivors(
+    tmp_path, tiny_packed_dir,
+):
+    """Same isolation, but with enough survivors (2) to actually exercise the
+    real batched_generate() path end to end -- confirms `batched`/`batch_size`
+    metadata appears and the bad job never touches the others."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    bad = _batch_job(tmp_path, out_dir, "bad", "placeholder", model=str(tiny_packed_dir))
+    Path(bad.file_path).write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nbinary body")
+    good_jobs = [
+        _batch_job(tmp_path, out_dir, f"good{i}", f"Hello world {i}.",
+                   model=str(tiny_packed_dir))
+        for i in range(2)
+    ]
+    jobs = [bad, *good_jobs]
+
+    events = []
+    pool = EnginePool()
+    try:
+        run_generation_batch(jobs, pool=pool,
+                              emit=lambda jid, e: events.append((jid, e)),
+                              should_cancel=lambda jid: False)
+    finally:
+        pool.close()
+
+    assert bad.status == JobStatus.ERROR
+    for job in good_jobs:
+        assert job.status == JobStatus.DONE
+        assert job.metrics["batched"] is True
+        assert job.metrics["batch_size"] == 2
 
 
 def test_run_generation_derived_cap_clamps_to_min(tmp_path, monkeypatch):

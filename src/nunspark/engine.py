@@ -8,11 +8,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map, tree_unflatten
-from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
 from .architectures import get_architecture
-from .archspec import LayerContext, UniformCausal
+from .archspec import LayerContext, UniformCausal, _ConstMask
 from .manifest import Manifest
 from .piece_store import PieceStore
 from .piece_cache import PieceCache
@@ -654,7 +654,33 @@ class StreamingEngine:
             "speculative": self.cache.stats()["speculative"],
         }
 
-    def forward(self, tokens: mx.array, kv=None) -> mx.array:
+    def _padded_mask_index(self, h: mx.array, kv, pad_lengths: mx.array):
+        """MaskIndex for a LEFT-PADDED batched pass (Plan 5 M3b-1).
+
+        Builds ONE additive-equivalent key-padding+causal mask, shared by every
+        layer, exactly as mlx_lm's own mask builder produces masks: a boolean
+        `create_causal_mask` array (True == attend). `left_padding=pad_lengths`
+        masks, for each row i, the first `pad_lengths[i]` key columns (the
+        left-pad slots) at EVERY query row, while the causal term
+        (`linds >= rinds`) handles the within-window ordering — so a real query
+        attends only to real keys at the same relative distances as the unpadded
+        single-sequence run. The key length it spans is the FULL current length
+        S = offset + N (N = h.shape[1] this window, offset = kv's shared offset
+        before this window is appended), so the mask persists correctly across
+        chunked prefill windows and every decode step, and it masks ONLY pad
+        columns (< pad_lengths[i]), never real ones.
+
+        Only reached on the padded batched path; the None path never calls this
+        and is byte-for-byte unchanged. All in-scope archs share one causal mask
+        (UniformCausal); sliding-window/Rotating archs are rejected by
+        `batched_generate` before any forward, so no per-layer windowed pad mask
+        is ever needed here.
+        """
+        offset = kv.get(0).offset if kv is not None else 0
+        mask = create_causal_mask(h.shape[1], offset, left_padding=pad_lengths)
+        return _ConstMask(mask)
+
+    def forward(self, tokens: mx.array, kv=None, pad_lengths: mx.array | None = None) -> mx.array:
         # Advance the cache's speculative-protection epoch: one call per forward
         # pass, so a speculative expert survives its insertion pass plus exactly
         # the next pass (the one its temporal prediction is for).
@@ -672,7 +698,14 @@ class StreamingEngine:
         h = self._embed(tokens)
         if self._embed_scale is not None:
             h = h * self._embed_scale
-        masks = self._mask_plan.build(h, kv)
+        # pad_lengths is None for every existing caller -> the mask plan is
+        # consulted exactly as before, so the graph is byte-for-byte identical.
+        # Only the left-padded batched path (Plan 5 M3b-1) overrides the mask,
+        # promoting it to a full causal+key-padding array in one step.
+        if pad_lengths is None:
+            masks = self._mask_plan.build(h, kv)
+        else:
+            masks = self._padded_mask_index(h, kv, pad_lengths)
 
         n = self.manifest.num_layers
         for layer in range(n):
