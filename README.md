@@ -13,7 +13,10 @@ then claws the speed back with three levers that only make sense in the disk-bou
   ~100 MB/token instead of ~1 GB.
 - **Deep-K speculative decoding** — on disk-bound hardware the draft model's compute is free,
   so speculation can go far deeper (K=16–24) than GPU serving ever would. One weight sweep
-  buys up to 7 accepted tokens. Lossless: output is bit-identical to running the target alone.
+  buys up to 7 accepted tokens. Lossless: every emitted token is the target's own argmax
+  (deterministic per config); on large real models fp16 numerics under different verify-pass
+  shapes can occasionally flip an argmax near-tie (~1/100 tokens, self-healing) versus running
+  single-token greedy, so identity is target-verified, not guaranteed byte-for-byte.
 - **Byte-budgeted streaming engine** — every forward pass verified bit-identical to full-load
   mlx-lm, fp16 and 4-bit, across 24 registered architectures.
 
@@ -36,8 +39,11 @@ hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality 
 
 - **16 GB** → `Qwen3-30B-A3B-4bit` with `--budget 8GB` (1.3–2.1 tok/s greedy, up to 1.54
   speculative).
-- **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit` with
-  `--budget 48GB` (community: 4.57 tok/s spec vs 3.39 tok/s greedy on code).
+- **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit`
+  with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` (community: 4.57 tok/s spec vs 3.39
+  greedy on code at 64 GB/budget 48GB; 1.16 spec vs 0.10 greedy on a 32 GB M1 Pro at budget
+  16GB). **The draft must share the target's tokenizer** — the default draft (Qwen3-0.6B) does
+  not match Llama, and a mismatched draft makes the speculative arm useless (~0 acceptance).
 - **64 GB+** → `gpt-oss-120b-4bit` with `--budget 58GB` (1.65–1.96 tok/s greedy).
 
 The 70B and 120B numbers above are community-verified (M1 Max, 64 GB, v0.5.0) — see
@@ -83,7 +89,10 @@ accepted draft token is nearly free — it saves a full weight-read pass instead
 extra latency. Measured acceptance multipliers rose from ~2.5× to ~5× as K grew, while naive
 tok/s fell — opposite slopes, which is the signal that this regime rewards deep speculation
 differently than GPU serving does. And it's lossless: the target model verifies every draft
-token, so output is identical to running the target alone. See [requirment.md](requirment.md)
+token, so every emitted token is the target's own argmax (deterministic per config) -- though
+not guaranteed byte-for-byte vs single-token greedy at model scale, since a multi-token verify
+pass runs fp16 numerics under different kernel shapes (rare, self-healing near-tie flips; see
+docs/plan5-m2-mismatch-investigation.md). See [requirment.md](requirment.md)
 for the full analysis and caveats (vocab lock-in between draft/target, etc). The dense-model
 benchmarks in [report.md](report.md) confirmed it, and added a second lesson:
 **draft–target agreement, not resident cache size, is the primary determinant of throughput.**
@@ -150,6 +159,8 @@ are written up in [docs/](docs/) gate summaries.
 - **Local web UI** (`nunspark web`) — a FastAPI app for long, document-driven **batch**
   generation (not interactive chat — this engine is seconds-per-token). Upload files, submit a
   batch, get one generation job per file streamed to disk with live progress over SSE.
+  Compatible jobs are decoded **together** (up to 8 sharing every weight read — measured
+  2.3× total throughput at 8 jobs for ~8% more memory; see the Web UI section).
   Plain-text uploads only (.txt/.md): PDFs and other binaries are rejected with a clear
   error — extract the text first. Prompts are also capped against your machine's unified
   RAM (the KV cache grows ~100 KB/token on a 30B model; an uncapped mega-prompt can
@@ -253,6 +264,7 @@ Key flags:
 | `--eagle-drafter <path>` | Use a trained EAGLE feature-level drafter instead of a full draft model. |
 | `--ngram-draft` | Model-free prompt-lookup speculative decoding: drafts `--num-draft-tokens` tokens from the most recent prior occurrence of the context suffix. Zero draft-model cost, tokenizer-exact, lossless. Mutually exclusive with `--draft-model`/`--eagle-drafter`. |
 | `--ngram-max` | Longest suffix n-gram tried by `--ngram-draft` (default 3). |
+| `--no-ngram-adaptive` | Disable the n-gram drafter's adaptive policy. By default it watches its own acceptance rate, shrinks its proposals when they stop earning, and switches itself off entirely (re-probing cheaply every ~50 steps) when speculation isn't paying — so on workloads where prompt-lookup can't win (most MoE decoding) it costs ≈nothing instead of 2–3× throughput. Pass this flag to pin the fixed `--num-draft-tokens` behavior for benchmarking. |
 | `--num-draft-tokens` | Draft tokens proposed per speculative sweep (default 16 — the "deep-K" lever described above). |
 | `--accept-top-k` | `1` = lossless speculative decoding; `>1` = fast mode (bounded deviation from the target distribution). |
 | `--metrics` | Print tok/s, peak memory, cache hit/miss, and (if speculative) acceptance-multiplier stats after generation. |
@@ -345,6 +357,17 @@ becomes one generation job; output streams to `<output_dir>/<name>.out.txt` with
 `.meta.json` sidecar, and progress is pushed live over SSE. This is built for long
 document-batch jobs, not interactive chat — the engine runs seconds-per-token.
 
+**Batched decode.** Queued jobs with matching settings (same model, budget, KV options,
+temperature, max tokens, no draft model) are automatically decoded together, up to 8 at a
+time, sharing every weight read: each layer's core is read once for the whole group and the
+group's fired experts are loaded as one union. Measured on Qwen3-30B-A3B at an 8 GB budget,
+8 jobs together produce **2.3× the total tokens/s** of running them back-to-back, for ~8%
+more peak memory. Batched rows are target-greedy correct but, like all multi-token passes,
+not guaranteed byte-identical to a solo run of the same prompt (see the exactness note
+above); a job's `.meta.json` records `batched`/`batch_size`, and tokens for batched jobs
+arrive in a burst when the group finishes rather than streaming one by one. Set
+`batch: false` under advanced settings to force sequential runs.
+
 ## Community benchmark
 
 ```bash
@@ -408,9 +431,11 @@ tests/                                                       # pytest suite, mir
 - I/O warming (`--io-threads`/`--warm-window`) was investigated in depth and found to be net-
   neutral-to-negative versus plain `mmap` in most tested configurations — it's exposed as a
   flag for experimentation, not recommended by default.
-- This is a single-stream engine: the server and web UI both process one generation at a time
-  (no concurrent-request batching) since the whole point is disk-bound streaming, not
-  throughput-oriented serving.
+- The engine decodes one *stream* at a time, but the web UI batches compatible queued jobs
+  into a single lock-step decode (up to 8 rows sharing every weight sweep — see the Web UI
+  section). `nunspark serve` still processes one request at a time: true continuous batching
+  (requests joining a running batch) is not implemented. Sliding-window models (gpt-oss)
+  are excluded from batched decode and fall back to sequential runs.
 
 ## License
 

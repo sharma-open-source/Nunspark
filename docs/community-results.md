@@ -41,7 +41,36 @@ Notes:
   (highest expert reuse, 82% hit), while code is slowest — expert diversity on
   code prompts is brutal at 160 experts/layer.
 
-## mlx-community/gpt-oss-120b-MXFP4-Q8 (MoE, 36L x 128 experts, 4 fired)
+## mlx-community/Qwen3-235B-A22B-4bit (MoE, 94L x 128 experts, 8 fired)
+
+### Apple M3 Ultra, 96 GB RAM, macOS 26.5.2 — nunspark 0.7.0, mlx 0.31.2 (2026-07-16)
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 0.29 | — | 83.3 | 1486 | 66.44 |
+| code | spec | 0.29 | 4.00 | 67.8 | 5096 | 66.85 |
+| prose | greedy | 0.36 | — | 85.8 | 1273 | 66.45 |
+| prose | spec | 0.37 | 3.85 | 77.8 | 3139 | 66.87 |
+| reasoning | greedy | 0.30 | — | 82.8 | 1543 | 66.47 |
+| reasoning | spec | 0.58 | 11.11 | 54.1 | 3399 | 66.89 |
+
+settings: budget=64GB, max_tokens<=100, speculative=on, K=24 (default Qwen3-0.6B draft)
+
+Notes:
+- First completed 235B run (a 64 GB volunteer previously aborted this model —
+  "connection became unstable"). ~130 GB pack on 96 GB RAM (~1.4x over-commit),
+  budget=64GB covers about half the pack → 83–86% expert hit, but A22B's per-token
+  demand (~11 GB of experts at 4-bit) means even 15% misses cost ~1.3–1.5 GB/token.
+- **First MoE spec WIN: reasoning 0.58 vs 0.30 greedy (1.9x, M=11.11).** The key
+  difference from every losing MoE spec run: the default Qwen3-0.6B draft SHARES
+  this target's tokenizer, so acceptance is real (M 3.85–11.11) instead of
+  bonus-token-only. The verify-union tax is still there (3.1–5.1 GB/token vs
+  1.3–1.5 greedy) but high-enough M pays for it.
+- Clean empirical break-even on this geometry: M≈4 is par (code M=4.00 → 0.29 vs
+  0.29; prose M=3.85 → 0.37 vs 0.36), M=11 wins ~2x. Refines backlog #5: the rule
+  isn't "spec off for MoE" but "spec only pays on MoE when the draft is
+  tokenizer-matched and M clears ~K/6-ish; mismatched drafts and n-gram at K=16-24
+  always lost."
 
 ### Apple M5 Max, 128 GB RAM, macOS 26.5 — nunspark 0.7.0, mlx 0.32.0 (2026-07-16)
 
@@ -90,6 +119,33 @@ Notes:
 
 ## mlx-community/Llama-3.3-70B-Instruct-4bit (dense, 70B)
 
+### Apple M1 Pro, 32 GB RAM, macOS 26.5.2 — nunspark 0.7.0, mlx 0.32.0 (2026-07-16)
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 0.10 | — | — | — | 18.34 |
+| code | spec | 1.16 | 14.29 | — | — | 18.64 |
+| prose | greedy | 0.09 | — | — | — | 18.35 |
+| prose | spec | 0.33 | 4.00 | — | — | 18.63 |
+| reasoning | greedy | 0.10 | — | — | — | 18.35 |
+| reasoning | spec | 0.69 | 7.69 | — | — | 18.66 |
+
+settings: budget=16GB, max_tokens<=100, speculative=on, K=24,
+draft **mlx-community/Llama-3.2-1B-Instruct-4bit** (tokenizer-matched, NOT the default)
+
+Notes:
+- **Cleanest demonstration of the deep-K thesis to date: +1097% on code (0.10 → 1.16
+  tok/s, M=14.29)** — a 40 GB dense model on a 32 GB machine, budget only 16GB, i.e.
+  the "genuinely can't fit" regime where every greedy token reads ~23 GB and every
+  accepted draft token saves a full weight sweep (MB/token 23,234 → 1,969, 12x).
+- The volunteer first hit the README/default footgun: the default Qwen3-0.6B draft
+  does not share Llama's tokenizer (128256-token vocab); bench warns "acceptance
+  will likely be ~0" but runs anyway, producing ~0.10 tok/s in BOTH columns — which
+  reads as "speculation doesn't work". Swapping in the 0.7 GB Llama-3.2-1B draft
+  produced the numbers above. See backlog #6 (matched-draft defaults).
+- Same M values (14.29 / 4.00 / 7.69) as the M1 Max 64 GB run at budget=48GB —
+  acceptance is a property of the draft/target/prompt, independent of cache size.
+
 ### Apple M1 Max, 64 GB RAM, macOS 26.5.2 — nunspark 0.5.0, mlx 0.32.0 (2026-07-15)
 
 | workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
@@ -115,6 +171,49 @@ Notes:
   need explanation. Needs local reproduction — see backlog.
 
 ## mlx-community/Qwen3-30B-A3B-4bit (MoE, 48L x 128 experts, 8 fired)
+
+### Apple M1 Pro, 32 GB RAM, macOS 26.5.2 — nunspark 0.7.0, mlx 0.32.0 (2026-07-16) — 19-run stability study
+
+The most rigorous community submission to date: 19 full bench runs across two
+budgets, with app-load A/B and idle-gap conditions. Representative reports:
+
+**budget=8GB** (steady state, n=6):
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 1.61 | — | 83.1 | 193 | 10.09 |
+| code | spec | 1.83 | 4.55 | 64.5 | 662 | 10.33 |
+| prose | greedy | 2.07 | — | 86.3 | 157 | 10.12 |
+| prose | spec | 2.17 | 4.35 | 79.8 | 307 | 10.35 |
+| reasoning | greedy | 1.70 | — | 82.8 | 198 | 10.14 |
+| reasoning | spec | 3.00 | 9.09 | 59.0 | 439 | 10.37 |
+
+**budget=16GB** (pack is 16 GB → effectively RAM-resident):
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 4.25 | — | 89.8 | 119 | 14.28 |
+| code | spec | 4.22 | 4.55 | 91.6 | 127 | 15.41 |
+| prose | greedy | 4.50 | — | 90.5 | 111 | 13.43 |
+| prose | spec | 4.31 | 4.35 | 91.9 | 116 | 14.27 |
+| reasoning | greedy | 4.38 | — | 89.7 | 120 | 14.45 |
+| reasoning | spec | 6.79 | 9.09 | 85.9 | 123 | 14.98 |
+
+settings: budget as marked, max_tokens<=100, speculative=on, K=24 (default Qwen3-0.6B draft)
+
+Study findings (full stats in the volunteer's report):
+- Determinism confirmed at scale: M byte-identical across all 19 runs
+  (4.55/4.35/9.09); expert-hit% and MB/token identical within 0.2pp at a
+  given budget.
+- Budget 8→16 GB: greedy +103–155% (1.5–1.8 → 3.7 tok/s steady state).
+- Spec gain scales inversely with cache coverage: +3% at 16GB (RAM-resident,
+  within noise except reasoning +60%), +20–103% at 8GB — consistent with the
+  70B result below (+1097% in the can't-fit regime).
+- Methodology lessons (→ backlog #6): first-ever run downloads the draft
+  mid-run (worst spec figures of any run); first ~2 runs after cold start read
+  ~15% low; a 5-min idle gap cost spec 20%; apps open vs closed = no measurable
+  effect (mixed-sign noise) — what looked like an app effect was thermal
+  recovery.
 
 ### Apple M1 Max, 64 GB RAM, macOS 26.5.2 — nunspark 0.5.0, mlx 0.32.0 (2026-07-15)
 
@@ -154,8 +253,10 @@ n-gram spec (K=16) final (`scripts/results/m5_120b_ngram_bench.json`):
 
 The MoE verify-union tax loses even with a zero-cost, tokenizer-correct drafter:
 3–5x bytes/token vs greedy, expert hit rate halves, M never exceeds 1.39.
-deviation_rate = 0.0 everywhere — output bit-identical to greedy (lossless
-acceptance verified end-to-end on rotating caches). Conclusion in
+deviation_rate = 0.0 everywhere — every accepted token is the target's own
+argmax (lossless acceptance verified end-to-end on rotating caches), though
+not guaranteed byte-identical to single-token greedy at model scale (see
+docs/plan5-m2-mismatch-investigation.md). Conclusion in
 `docs/plan4-m5-gate-summary.md`: speculative decoding is the wrong lever for
 sparse-MoE streaming; it is the lever for dense streamed models.
 

@@ -47,11 +47,32 @@ def _prefill(engine, ids, kv, chunk: int = PREFILL_CHUNK) -> mx.array:
     return logits
 
 
+def _near_tie_rows(vlog0: mx.array, threshold: float = 0.5) -> int:
+    """Count rows of a [K+1, V] verify-pass logit slab whose top-2 fp32 gap
+    is below `threshold`. `mx.topk` returns values in ASCENDING order per
+    row, so the top-2 are the last two columns; the gap is column[-1] minus
+    column[-2] (argmax minus runner-up, always >= 0). One small host sync
+    (`.tolist()`/`.item()`-equivalent) per verify pass, same cost class as
+    the `targ` pull this mirrors."""
+    top2 = mx.topk(vlog0.astype(mx.float32), k=2, axis=-1)
+    gaps = top2[:, -1] - top2[:, -2]
+    return int((gaps < threshold).sum().item())
+
+
 def _sample(logits: mx.array, temp: float) -> int:
     if temp <= 0.0:
         return int(mx.argmax(logits, axis=-1).item())
     # categorical takes unnormalized logits, so scaling by 1/temp is sufficient.
     return int(mx.random.categorical(logits * (1.0 / temp)).item())
+
+
+def _sample_batch(logits: mx.array, temp: float) -> list[int]:
+    """Sample one token per row of a [B, V] logit slab. temp<=0 -> per-row
+    argmax (greedy); temp>0 -> per-row categorical. One host sync for the whole
+    batch (same cost class as the single-row `.item()` in `_sample`)."""
+    if temp <= 0.0:
+        return mx.argmax(logits, axis=-1).tolist()
+    return mx.random.categorical(logits * (1.0 / temp)).tolist()
 
 
 def check_kv_quant_support(engine: StreamingEngine, kv_quant: KVQuant | None) -> None:
@@ -79,6 +100,14 @@ class SpecStats:
     draft_tokens_proposed: int = 0
     accepted_offpath: int = 0   # accepted draft tokens that were NOT the target argmax (lossy)
     accepted_total: int = 0     # accepted draft tokens (excludes the bonus correction)
+    near_tie_rows: int = 0
+    """Count of verify-pass logit rows whose argmax was within 0.5 (fp32)
+    logits of the runner-up. This is EXPOSURE to fp16-numerics argmax
+    near-tie flips across different verify-pass shapes (see
+    docs/plan5-m2-mismatch-investigation.md), not a count of actual flips --
+    most near-tie rows still land on the same argmax a single-token greedy
+    pass would produce. A near-zero count means the run's outputs are
+    unusually safe from the documented (rare, self-healing) mismatch."""
 
     @property
     def multiplier(self) -> float:
@@ -158,6 +187,142 @@ def generate(
             tmp.cleanup()
 
 
+def _reject_rotating(engine: StreamingEngine) -> None:
+    """Raise ValueError if the engine's architecture uses any sliding-window
+    (RotatingKVCache) layer. Batched decode (Plan 5 M3b-1) shares ONE KV store
+    with a single offset across all rows; RotatingKVCache's per-sequence circular
+    bookkeeping (_idx, window-clamped masks) is written for a single sequence and
+    gives no correct B>1 ragged-length behavior, so these archs are gated OUT of
+    v1. Checked BEFORE any forward so a bad arch fails cheaply and clearly."""
+    from .archspec import Rotating
+    kinds = engine.cache_kinds
+    if kinds is not None and any(isinstance(k, Rotating) for k in kinds):
+        raise ValueError(
+            f"{engine.manifest.model_type} uses sliding-window attention "
+            "(RotatingKVCache); batched_generate supports full-attention archs "
+            "only (drop it to the sequential generate() path)")
+
+
+def _prefill_batched(
+    engine: StreamingEngine,
+    batch_ids: mx.array,
+    kv: KVStore,
+    pad_lengths: mx.array | None,
+    chunk: int = PREFILL_CHUNK,
+) -> mx.array:
+    """Left-padded batched prefill in fixed-size [B, chunk] windows.
+
+    `batch_ids` is [B, L] (every row left-padded to the common length L);
+    `pad_lengths` is the [B] per-row left-pad count, or None when no row is
+    padded (equal-length batch -> exactly the mask path `generate()` takes).
+    Each window is one `engine.forward` against the shared-offset kv, with the
+    key-padding mask rebuilt per window against the growing key length. Returns
+    the final-position logits [B, V]. Chunking bounds peak activation memory by
+    one [B, chunk] window, which matters now that activations scale with B.
+    """
+    L = batch_ids.shape[1]
+    logits = None
+    for start in range(0, L, chunk):
+        w = batch_ids[:, start:start + chunk]
+        logits = engine.forward(w, kv=kv, pad_lengths=pad_lengths)[:, -1, :]
+        # Force each window's graph + kv appends before the next so peak
+        # activation stays bounded by one chunk (scheduling only; numerics
+        # untouched). Mirrors _prefill.
+        mx.eval(logits)
+    return logits
+
+
+def batched_generate(
+    engine: StreamingEngine,
+    prompts: list[list[int]],
+    max_tokens: int = 64,
+    temp: float = 0.0,
+    kv_budget: int = 10**12,
+    prefetch: bool = True,
+    kv: KVStore | None = None,
+    kv_quant: KVQuant | None = None,
+    pad_id: int = 0,
+    eos_id: int | None = None,
+    prefill_chunk: int = PREFILL_CHUNK,
+) -> list[list[int]]:
+    """Batched greedy/temperature decode: B prompts through ONE streamed weight
+    sweep per step (Plan 5 M3b-1 / adoption A3).
+
+    The B prompts are LEFT-padded to a common length so every row's next token
+    lands at the same shared KV offset; one batched KVStore (per-layer caches gain
+    a leading B dim, single shared offset) holds their state. Decode is lock-step:
+    each step is one `engine.forward([B, 1])`, sampled per row. A row that hits
+    `eos_id` or `max_tokens` keeps riding the sweep (fed `pad_id`, its output
+    frozen) until EVERY row is finished — the weight sweep is shared regardless of
+    how many rows are still live, so wall-time stays ~flat. Greedy/temperature
+    only; no draft model in v1.
+
+    Exactness contract (honest; see docs/plan5-m2-mismatch-investigation.md and
+    the §14 orchestrator amendment in docs/plan5-m3-design.md): each row's output
+    is target-greedy correct. It is TOKEN-identical to running `generate()` on
+    that prompt sequentially on small fixtures (where fp near-ties do not occur),
+    and the tests assert exact equality there. At model scale it is NOT guaranteed
+    byte-identical for mixed-length batches: a left-padded row's RoPE is evaluated
+    at shifted absolute positions and batched GEMM may tile reductions differently,
+    so rare argmax near-tie flips can diverge from the sequential run (self-healing,
+    documented). B=1 / equal-length batches take the pad-free path (`pad_lengths`
+    None) and match `generate()` exactly.
+
+    Raises ValueError for sliding-window (RotatingKVCache) architectures, which
+    are out of v1 scope. KVStore lifecycle follows `generate()`'s own-or-borrow
+    pattern; `kv_quant`, if given, quantizes the KV cache (unsupported on
+    attention-sink architectures; raises ValueError).
+    """
+    _reject_rotating(engine)
+    check_kv_quant_support(engine, kv_quant)
+
+    B = len(prompts)
+    L = max(len(p) for p in prompts)
+    pad_counts = [L - len(p) for p in prompts]
+    # Left-pad each row to L; the real tokens of every row therefore END at the
+    # shared position L-1, so the first generated token is at the shared offset L.
+    rows = [[pad_id] * (L - len(p)) + list(p) for p in prompts]
+    batch_ids = mx.array(rows)                       # [B, L]
+    # No row padded -> no key-padding needed; pass None so the batch takes the
+    # exact mask path (and thus exact numerics) of a per-row generate() run.
+    pad_lengths = mx.array(pad_counts) if max(pad_counts) > 0 else None
+
+    own_kv = kv is None
+    tmp = None
+    if own_kv:
+        tmp = tempfile.TemporaryDirectory(prefix="nunspark_kv_")
+        try:
+            kv = _open_kv_store(engine, tmp.name, kv_budget, prefetch, kv_quant)
+        except BaseException:
+            tmp.cleanup()
+            raise
+    try:
+        logits = _prefill_batched(engine, batch_ids, kv, pad_lengths, prefill_chunk)
+        outputs: list[list[int]] = [[] for _ in range(B)]
+        finished = [False] * B
+        for _ in range(max_tokens):
+            toks = _sample_batch(logits, temp)       # list[int], len B
+            for i in range(B):
+                if finished[i]:
+                    continue
+                outputs[i].append(toks[i])
+                if eos_id is not None and toks[i] == eos_id:
+                    finished[i] = True
+            if all(finished):
+                break
+            # Finished rows keep the batch shape but are fed pad_id (output frozen,
+            # future logits discarded); their per-row KV growth never touches live
+            # rows (causal per-row attention, no cross-row mixing).
+            feed = [toks[i] if not finished[i] else pad_id for i in range(B)]
+            nxt = mx.array(feed)[:, None]            # [B, 1]
+            logits = engine.forward(nxt, kv=kv, pad_lengths=pad_lengths)[:, -1, :]
+        return outputs
+    finally:
+        if own_kv:
+            kv.close()
+            tmp.cleanup()
+
+
 def stream_generate(
     engine: StreamingEngine,
     prompt: list[int],
@@ -228,8 +393,14 @@ def speculative_generate(
 
     `accept_top_k` controls the accept test:
       * 1 (default) -> LOSSLESS: a draft token is accepted only if it equals the
-        target's argmax, so output is bit-identical to greedy `generate()`
-        regardless of draft quality.
+        target's argmax. Output is target-verified and lossless-by-construction:
+        every emitted token is the target's own argmax from a verification pass,
+        deterministic for a given config, regardless of draft quality. Note: not
+        guaranteed byte-identical to single-token `generate()` on large real
+        models -- a multi-token verify pass computes fp16 numerics under
+        different kernel shapes, and rare argmax near-tie flips (~1/100 tokens,
+        self-healing, see docs/plan5-m2-mismatch-investigation.md) can occur;
+        tiny-fixture tests are exactly bit-identical.
       * >1 -> opt-in FAST MODE: a draft token is accepted if it lies within the
         target's top-k logits (still a token the target conditioned on during
         verification), trading exactness for a higher acceptance multiplier.
@@ -297,6 +468,7 @@ def speculative_generate(
             targ = mx.argmax(vlog[0], axis=-1).tolist()   # len K+1; targ[i] = argmax after position i
             if stats:
                 stats.target_passes += 1
+                stats.near_tie_rows += _near_tie_rows(vlog[0])
 
             # 3) Accept the longest prefix of plausible draft tokens.
             #    accept_top_k <= 1 -> lossless greedy (draft must equal the target argmax).
@@ -383,9 +555,15 @@ def ngram_speculative_generate(
     the most recent prior occurrence of the current context suffix and returning
     the tokens that followed; the streamed target verifies them in ONE forward
     pass. This is LOSSLESS greedy: a draft token is accepted only if it equals
-    the target's argmax, so the output is bit-identical to plain `generate()`
-    regardless of draft quality. When the drafter finds no match it returns [],
-    and this round degrades to a single greedy target step.
+    the target's argmax. Output is target-verified and lossless-by-construction:
+    every emitted token is the target's own argmax from a verification pass,
+    deterministic for a given config, regardless of draft quality. Note: not
+    guaranteed byte-identical to single-token `generate()` on large real models
+    -- a multi-token verify pass computes fp16 numerics under different kernel
+    shapes, and rare argmax near-tie flips (~1/100 tokens, self-healing, see
+    docs/plan5-m2-mismatch-investigation.md) can occur; tiny-fixture tests are
+    exactly bit-identical. When the drafter finds no match it returns [], and
+    this round degrades to a single greedy target step.
 
     Even modest acceptance amortizes the streaming cost of a multi-token verify
     pass (core re-reads + overlapping expert unions) over several emitted tokens,
@@ -395,6 +573,13 @@ def ngram_speculative_generate(
     counts proposed n-gram tokens, `accepted_total` counts accepted ones (the
     bonus correction is not a draft token), `target_passes` counts every target
     forward (verify sweeps AND single greedy fallbacks).
+
+    After each verify round, calls `drafter.observe(Kq, m)` if the drafter
+    exposes that method (an `NGramDrafter` with `adaptive=True` shrinks/grows
+    its next proposal length based on how well this round verified; plain
+    stub drafters without `observe` are unaffected). This is output-safe by
+    construction: acceptance is lossless, so proposal LENGTH cannot change
+    which tokens are emitted, only how much verify work future rounds cost.
 
     KVStore lifecycle and `processed_tokens` semantics follow `generate()`;
     `kv_quant`, if given, quantizes the KV cache (unsupported on attention-sink
@@ -461,6 +646,7 @@ def ngram_speculative_generate(
             targ = mx.argmax(vlog[0], axis=-1).tolist()   # targ[i] = argmax after position i
             if stats:
                 stats.target_passes += 1
+                stats.near_tie_rows += _near_tie_rows(vlog[0])
 
             # 3) Accept the longest prefix where draft == target argmax (lossless).
             m = 0
@@ -470,6 +656,8 @@ def ngram_speculative_generate(
                 m += 1
             if stats:
                 stats.accepted_total += m
+            if hasattr(drafter, "observe"):
+                drafter.observe(Kq, m)
             bonus = int(targ[m])   # correct token after last accepted (m <= Kq, len(targ)=Kq+1)
 
             # 4) Commit the accepted prefix [b, q0..q_{m-1}] (m+1 tokens) to the

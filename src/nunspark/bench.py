@@ -155,7 +155,18 @@ def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, 
             "multiplier": spec_stats.multiplier,
             "deviation_rate": spec_stats.deviation_rate,
             "draft_tokens_per_sweep": draft_tokens,
+            "near_tie_rows": spec_stats.near_tie_rows,
         }
+        # ngram-spec drafter carries live adaptive state (M2); surface the
+        # k_cur trajectory so a bench report shows whether adaptation fired.
+        if mode == "ngram-spec" and drafter is not None and getattr(drafter, "adaptive", False):
+            result["spec_stats"]["ngram_adaptive"] = True
+            result["spec_stats"]["k_min_seen"] = drafter.k_min_seen
+            result["spec_stats"]["k_max_seen"] = drafter.k_max_seen
+            result["spec_stats"]["disabled_rounds"] = drafter.disabled_rounds
+            result["spec_stats"]["probes"] = drafter.probes
+        elif mode == "ngram-spec" and drafter is not None:
+            result["spec_stats"]["ngram_adaptive"] = False
     return result
 
 
@@ -169,6 +180,7 @@ def run_bench(
     workloads: list[str] | None = None,
     out: Path | None = None,
     ngram: bool = False,
+    ngram_adaptive: bool = True,
 ) -> list[dict]:
     """Run the bench suite over an already-packed model dir.
 
@@ -188,7 +200,8 @@ def run_bench(
 
     prompts = PROMPTS if not workloads else [(l, p) for l, p in PROMPTS if l in workloads]
 
-    ngram_drafter = NGramDrafter(num_draft_tokens=draft_tokens) if ngram else None
+    ngram_drafter = NGramDrafter(num_draft_tokens=draft_tokens, adaptive=ngram_adaptive) \
+        if ngram else None
 
     draft_model = None
     if draft and not ngram:
@@ -217,13 +230,18 @@ def run_bench(
               f"{r['tokens_generated']} tokens")
 
         if ngram_drafter is not None:
-            print(f"  ngram-spec (K={draft_tokens}) ...")
+            adaptive_tag = " adaptive" if ngram_adaptive else ""
+            print(f"  ngram-spec (K={draft_tokens}{adaptive_tag}) ...")
             r = _run_one(packed, manifest, ids, eos, label, "ngram-spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
                          draft_tokens=draft_tokens, drafter=ngram_drafter)
             results.append(r)
+            k_range = ""
+            if ngram_adaptive:
+                k_range = (f", k={r['spec_stats']['k_min_seen']}-"
+                           f"{r['spec_stats']['k_max_seen']}")
             print(f"    {r['tok_s_decode']:.2f} tok/s, M={r['spec_stats']['multiplier']:.2f}, "
-                  f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens")
+                  f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens{k_range}")
         elif draft_model is not None:
             print(f"  spec (K={draft_tokens}) ...")
             r = _run_one(packed, manifest, ids, eos, label, "spec",
@@ -243,6 +261,7 @@ def run_bench(
                 "packed": str(packed),
                 "draft": draft,
                 "ngram": ngram,
+                "ngram_adaptive": ngram_adaptive if ngram else None,
                 "draft_tokens": draft_tokens,
                 "max_tokens": max_tokens,
                 "budget_bytes": budget_bytes,
@@ -322,6 +341,9 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
     has_spec = False
     draft_tokens = None
     budget_bytes = None
+    ngram_adaptive = None
+    k_min_seen = None
+    k_max_seen = None
     for r in results:
         m = r.get("spec_stats", {}).get("multiplier")
         m_str = f"{m:.2f}" if m is not None else "—"
@@ -335,10 +357,18 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
             f"{r.get('tok_s_decode', 0.0):.2f} | {m_str} | {eh_str} | {mb_str} | "
             f"{r.get('peak_memory_gb', 0.0):.2f} |"
         )
-        if r.get("mode") == "spec":
+        if r.get("mode") in ("spec", "ngram-spec"):
             has_spec = True
             if draft_tokens is None:
                 draft_tokens = r.get("spec_stats", {}).get("draft_tokens_per_sweep")
+        if r.get("mode") == "ngram-spec" and r.get("spec_stats", {}).get("ngram_adaptive"):
+            ngram_adaptive = True
+            k = r["spec_stats"].get("k_min_seen")
+            if k is not None:
+                k_min_seen = k if k_min_seen is None else min(k_min_seen, k)
+            k = r["spec_stats"].get("k_max_seen")
+            if k is not None:
+                k_max_seen = k if k_max_seen is None else max(k_max_seen, k)
         if budget_bytes is None:
             budget_bytes = r.get("budget_bytes")
 
@@ -355,6 +385,10 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
     settings += f", speculative={'on' if has_spec else 'off'}"
     if draft_tokens is not None:
         settings += f", K={draft_tokens}"
+    if ngram_adaptive:
+        settings += ", ngram-adaptive=on"
+        if k_min_seen is not None and k_max_seen is not None:
+            settings += f", k={k_min_seen}-{k_max_seen}"
     lines.append("")
     lines.append(settings)
 

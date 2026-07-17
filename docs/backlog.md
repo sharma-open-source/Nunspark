@@ -103,3 +103,52 @@ workloads (M 1.15–1.39, bytes/token 3–5x greedy, expert hit halves). Recomme
 `nunspark bench` should default the spec arm OFF (or to a small K) when the manifest
 has experts, and print why. Small-K sweep (K=2–4) is the remaining open question —
 at M~1.3 with K=3 the union tax shrinks ~5x, could break even.
+
+**Refinement (2026-07-16, community Qwen3-235B-A22B on M3 Ultra 96 GB):** first MoE
+spec WIN — reasoning 0.58 vs 0.30 greedy (M=11.11) with the default Qwen3-0.6B draft,
+which shares the Qwen3 tokenizer. Same run shows M≈4 is break-even (code M=4.00 and
+prose M=3.85 both ~par with greedy) despite a 2–3x MB/token union tax. So the rule is
+conditional, not blanket: default spec OFF for MoE when the draft tokenizer mismatches
+the target (or for n-gram at large K); keep it available — and maybe ON — when
+tokenizer-matched, since high-M workloads (reasoning) win ~2x. An adaptive policy
+could watch measured M for a few sweeps and disable spec if M stays below ~K/6.
+
+## 6. Bench hygiene: matched-draft defaults, draft pre-download, warm-up (MEDIUM)
+
+From the M1 Pro 32 GB 19-run study + follow-up comment (docs/community-results.md,
+2026-07-16):
+
+- **Matched-draft default (highest value).** `nunspark bench <llama-model>` pairs the
+  default Qwen3-0.6B draft with a Llama target; bench.py warns "acceptance will likely
+  be ~0" but runs anyway, so people publish ~0.10 tok/s in both columns and conclude
+  deep-K speculation doesn't work. The commenter swapped in
+  `mlx-community/Llama-3.2-1B-Instruct-4bit` (0.7 GB) and got M=14.29 / +1097% on code.
+  Fix: a small target-family → draft map (Qwen3 → Qwen3-0.6B, Llama-3.x →
+  Llama-3.2-1B-Instruct-4bit, no-match → `--ngram` or skip spec arm with a clear
+  message) instead of one hard-coded default; refuse the model-draft spec arm on
+  tokenizer mismatch unless `--force-draft`.
+- **Pre-download the draft before timing.** The first-ever spec run downloads the draft
+  mid-run and posts the worst numbers of any run in the study. Resolve/download the
+  draft during setup, before any timers start.
+- **Warm-up.** First ~2 runs after a cold start read ~15% low; a 5-minute idle gap cost
+  the spec arm 20% (draft + pages evicted). Options: one untimed warm-up pass before
+  the timed suite (or a `--warmup N` flag), and a note in the report when the run was
+  cold. The study also showed apps-open vs closed is pure noise — no need to tell
+  users to quit apps.
+- Determinism cross-check worth keeping: M is byte-identical across runs at temp=0, so
+  M diverging across machines/runs on the same model+draft+K indicates a real bug, not
+  noise.
+
+## 7. TensorFold adoptions — PROMOTED to Plan 5 (docs/plan5-tensorfold-adoptions.md)
+
+TensorFold (github.com/ashhart/TensorFold, MIT) — an independent MoE-streaming runtime
+on MLX — yielded three adoptions, planned and gated in Plan 5: (A1) garbage-drafter
+invariant test (a never-accepted drafter must reproduce greedy byte-for-byte; covers
+the untested verify_forward/commit_verified path), (A2) adaptive proposal shrink for
+the n-gram drafter (directly attacks #5's worst case: their data shows 15% acceptance
+at no slowdown), (A3) batched decode sharing per-layer expert unions across requests
+(their headline: 3.4 → 49 total tok/s at batch 16, near-flat memory). Their negative
+result — previous-token expert prefetch is a net slowdown (~43% consecutive-token
+overlap) — independently confirms our Phase-1 verdict; do not revisit. Their KV
+checkpoint w/ suffix-only prefill validates #2; when building #2, copy their
+`usage.prompt_tokens_details.cached_tokens` reporting.

@@ -10,7 +10,7 @@ from typing import Any, Callable
 import mlx.core as mx
 
 from ..archspec import KVQuant
-from ..generate import SpecStats, speculative_generate, stream_generate
+from ..generate import SpecStats, batched_generate, speculative_generate, stream_generate
 from ..kv_store import KVStore
 from ..sysmem import resolve_budget
 from ..sysmem import unified_ram_bytes as _unified_ram_bytes
@@ -419,6 +419,269 @@ def run_generation(
     }[job.status]
 
     emit({"type": event_type, "job": job.public()})
+
+
+def _fail_job(job: Job, exc: Exception, emit: Callable[[str, dict[str, Any]], None]) -> None:
+    """Mark `job` ERROR from a validation exception and report it on its own
+    event stream. Mirrors run_generation's except-block behavior (status,
+    error message, sidecar) so a job that fails before/outside the batched
+    call looks the same to the UI as one that failed inside run_generation."""
+    job.status = JobStatus.ERROR
+    job.error = f"{type(exc).__name__}: {exc}"
+
+    with suppress(OSError):
+        out_dir = Path(job.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = _unique_base(out_dir, job.file_name)
+        out_path = out_dir / f"{base}.out.txt"
+        out_path.touch()
+        job.output_path = str(out_path)
+        _write_sidecar(out_dir, job, base)
+
+    emit(job.id, {"type": "error", "job": job.public()})
+
+
+def _run_one(
+    job: Job,
+    *,
+    pool: EnginePool,
+    emit: Callable[[str, dict[str, Any]], None],
+    should_cancel: Callable[[str], bool],
+) -> None:
+    """Adapt the job-id-keyed batch emit/should_cancel to run_generation's
+    per-job signature, so the single-job sequential path can be reused
+    unchanged both for group-of-1 batches and for the fallback when
+    batched_generate itself raises."""
+    run_generation(
+        job, pool=pool,
+        emit=lambda e: emit(job.id, e),
+        should_cancel=lambda: should_cancel(job.id),
+    )
+
+
+def run_generation_batch(
+    jobs: list[Job],
+    *,
+    pool: EnginePool,
+    emit: Callable[[str, dict[str, Any]], None],
+    should_cancel: Callable[[str], bool],
+) -> None:
+    """Execute a group of param-compatible jobs as ONE batched_generate() call.
+
+    Grouping (which jobs land here, and the MAX_BATCH=8 cap from
+    docs/plan5-m3-design.md §16) is the caller's (webapp/jobs.py) job; this
+    function only assumes the group shares model/budget/kv_quant/
+    use_chat_template/temperature/max_tokens and has no draft model.
+
+    Validation runs in two stages BEFORE any batched forward, so a bad upload
+    or an over-cap prompt is isolated onto its own job (ERROR status, its own
+    event) and never sinks the rest of the group:
+      1. `_read_file_text` (no engine needed) -- catches binary uploads cheaply,
+         before paying for a model load, same guard as run_generation.
+      2. prompt construction + `_check_prompt_cap` (needs the shared engine's
+         tokenizer / geometry).
+    If fewer than 2 jobs survive validation, the survivor (if any) runs the
+    ordinary sequential path (`run_generation`) -- a group of 1 gets no benefit
+    from batching. If `batched_generate` itself raises (e.g. a sliding-window
+    arch slipped through the group-compatibility check upstream), the whole
+    surviving group falls back to running sequentially rather than failing.
+    """
+    if not jobs:
+        return
+
+    advanced0 = jobs[0].advanced or {}
+    budget = resolve_budget(advanced0.get("budget", "auto"))
+    kv_quant = _kv_quant(advanced0)
+
+    # Stage 1: upload guard, before any engine load.
+    texts: dict[str, str] = {}
+    survivors: list[Job] = []
+    for job in jobs:
+        try:
+            texts[job.id] = _read_file_text(Path(job.file_path))
+            survivors.append(job)
+        except Exception as exc:  # noqa: BLE001 -- isolate, never sink the group
+            _fail_job(job, exc, emit)
+
+    if not survivors:
+        return
+    if len(survivors) == 1:
+        _run_one(survivors[0], pool=pool, emit=emit, should_cancel=should_cancel)
+        return
+
+    handle = pool.acquire(
+        jobs[0].model, jobs[0].draft, budget_bytes=budget, kv_quant=kv_quant,
+    )
+    engine = handle.engine
+    tokenizer = handle.tokenizer
+
+    # Stage 2: prompt build + token cap (needs the shared tokenizer/engine).
+    prompts: dict[str, list[int]] = {}
+    survivors2: list[Job] = []
+    for job in survivors:
+        try:
+            prompt = build_prompt(
+                job.instruction, texts[job.id],
+                tokenizer=tokenizer, use_chat_template=job.use_chat_template,
+            )
+            if isinstance(prompt, str):
+                prompt = tokenizer.encode(prompt)
+            _check_prompt_cap(
+                len(prompt), engine=engine, budget_bytes=budget,
+                advanced=job.advanced or {},
+            )
+            prompts[job.id] = list(prompt)
+            survivors2.append(job)
+        except Exception as exc:  # noqa: BLE001 -- isolate, never sink the group
+            _fail_job(job, exc, emit)
+
+    if not survivors2:
+        return
+    if len(survivors2) == 1:
+        _run_one(survivors2[0], pool=pool, emit=emit, should_cancel=should_cancel)
+        return
+
+    # Cancellation cannot interrupt batched_generate mid-decode (it is not a
+    # generator -- all rows' tokens arrive together only once the whole lock-
+    # step loop finishes, see module docstring note below). The only place a
+    # cancel can take effect is before the call: drop already-cancelled jobs
+    # here rather than running (and discarding) their share of the batch.
+    live = [j for j in survivors2 if not should_cancel(j.id)]
+    live_ids = {j.id for j in live}
+    for job in survivors2:
+        if job.id not in live_ids:
+            job.status = JobStatus.CANCELLED
+            emit(job.id, {"type": "cancelled", "job": job.public()})
+
+    if not live:
+        return
+    if len(live) == 1:
+        _run_one(live[0], pool=pool, emit=emit, should_cancel=should_cancel)
+        return
+
+    for job in live:
+        job.status = JobStatus.RUNNING
+        emit(job.id, {"type": "started", "job": job.public()})
+
+    try:
+        _run_batched(
+            live, prompts, engine=engine, tokenizer=tokenizer,
+            kv_quant=kv_quant, emit=emit, should_cancel=should_cancel,
+        )
+    except Exception:  # noqa: BLE001
+        # batched_generate raised (e.g. a rotating arch slipped through the
+        # group key upstream) -- fall back to the sequential path per job
+        # rather than failing everyone in the group. run_generation re-does
+        # its own (cheap, cached-engine) validation and emits its own
+        # started/done/error events.
+        for job in live:
+            _run_one(job, pool=pool, emit=emit, should_cancel=should_cancel)
+
+
+def _run_batched(
+    jobs: list[Job],
+    prompts: dict[str, list[int]],
+    *,
+    engine: Any,
+    tokenizer: Any,
+    kv_quant: KVQuant | None,
+    emit: Callable[[str, dict[str, Any]], None],
+    should_cancel: Callable[[str], bool],
+) -> None:
+    """Run ONE batched_generate() call for `jobs` and fan the per-row results
+    back to each job's own output file / event stream by row index.
+
+    batched_generate() is not a generator (Plan 5 M3b-1, generate.py): the
+    lock-step decode loop returns only after every row has finished. So unlike
+    the sequential path's live per-token streaming, a batched job's "token"
+    events are emitted in one rapid burst, right after the whole group's
+    decode completes, in generation order -- the UI still sees the full text
+    appear, just not incrementally while it is being produced. This is a
+    direct, honest consequence of the shared weight-sweep design (§7 of
+    docs/plan5-m3-design.md): all rows' compute is inseparable until the batch
+    is done.
+    """
+    max_tokens = jobs[0].max_tokens
+    temp = jobs[0].temperature
+    eos = getattr(tokenizer, "eos_token_id", None)
+
+    t0 = time.perf_counter()
+    cache_baseline = _cache_snapshot(engine)
+
+    out_dirs: list[Path] = []
+    out_paths: list[Path] = []
+    bases: list[str] = []
+    for job in jobs:
+        out_dir = Path(job.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = _unique_base(out_dir, job.file_name)
+        out_path = out_dir / f"{base}.out.txt"
+        job.output_path = str(out_path)
+        out_dirs.append(out_dir)
+        out_paths.append(out_path)
+        bases.append(base)
+
+    with ExitStack() as stack:
+        out_fhs = [
+            stack.enter_context(p.open("w", encoding="utf-8")) for p in out_paths
+        ]
+        kv_tmp = stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="nunspark_web_kv_batch_")
+        )
+        kv = KVStore(
+            kv_tmp,
+            budget_bytes=_KV_BUDGET_BYTES,
+            prefetch=True,
+            cache_kinds=engine.cache_kinds,
+            kv_quant=kv_quant,
+        )
+        stack.callback(kv.close)
+
+        mx.reset_peak_memory()
+
+        prompt_list = [prompts[job.id] for job in jobs]
+        # Exactness contract (docs/plan5-m2-mismatch-investigation.md, and the
+        # §14/§15 orchestrator amendments in docs/plan5-m3-design.md): each
+        # row is target-greedy correct but not guaranteed byte-identical to a
+        # solo run() of that prompt -- left-padded rows evaluate RoPE at
+        # shifted absolute positions and batched GEMM tiling can differ from
+        # single-row GEMM, so rare argmax near-tie flips can diverge from the
+        # sequential run (self-healing, documented).
+        token_lists = batched_generate(
+            engine, prompt_list, max_tokens=max_tokens, temp=temp,
+            kv=kv, kv_quant=kv_quant, eos_id=eos,
+        )
+
+        for idx, job in enumerate(jobs):
+            out_ids: list[int] = []
+            for tok in token_lists[idx]:
+                if eos is not None and tok == eos:
+                    break
+                out_ids.append(tok)
+                delta = tokenizer.decode([tok])
+                if delta:
+                    out_fhs[idx].write(delta)
+                    out_fhs[idx].flush()
+                    emit(job.id, {"type": "token", "job_id": job.id, "text": delta})
+
+            job.tokens_done = len(out_ids)
+            metrics = _metrics(out_ids, t0, engine, kv, None, cache_baseline)
+            metrics["batched"] = True
+            metrics["batch_size"] = len(jobs)
+            job.metrics = metrics
+
+            job.status = (
+                JobStatus.CANCELLED if should_cancel(job.id) else JobStatus.DONE
+            )
+
+            with suppress(OSError):
+                _write_sidecar(out_dirs[idx], job, bases[idx])
+
+            event_type = {
+                JobStatus.DONE: "done",
+                JobStatus.CANCELLED: "cancelled",
+            }[job.status]
+            emit(job.id, {"type": event_type, "job": job.public()})
 
 
 def _cache_snapshot(engine: Any) -> dict[str, dict[str, int]]:

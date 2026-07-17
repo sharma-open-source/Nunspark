@@ -50,6 +50,11 @@ class Advanced(BaseModel):
     # None means "derive from unified memory"; set it to accept the swap risk
     # of a prompt whose KV cache may not fit.
     max_prompt_tokens: int | None = None
+    # Opt-out for the batch dispatcher (Plan 5 M3b-3, webapp/jobs.py): when
+    # False, this job's queue entry is never grouped with others into one
+    # batched_generate() call, even if another queued job is param-compatible
+    # with it. True (default) allows grouping.
+    batch: bool = True
 
 
 class BatchRequest(BaseModel):
