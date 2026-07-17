@@ -181,19 +181,24 @@ stale-row regression test in tests/test_scatter_persistent_bufs.py; full suite 3
 passed / same 4 known failures. **Project decode best on 16 GB: 2.5-2.8 tok/s live (user sweep), 4.2 in flushed
 controlled probes, vs the previous 1.6-1.65 headline.**
 
-**Budget formula RESOLVED same day.** The user's live 6/8/10 GB sweep (2.52 / 2.84 /
-1.33 tok/s, 200 tokens) showed the cliff sits ABOVE 8 GB on a fresh machine — the old
-flushed probes' 6-beats-8 was an artifact of adverse memory state, i.e. the cliff
-MOVES with machine load. Shipped in sysmem.py: `auto` keeps the 0.75*RAM - 4 GB
-ceiling but clamps to `available - 1 GB`, where available = macOS
-`memory_pressure -Q` free-percentage x total RAM (kernel estimate; vm_stat sum
-undercounts reclaimable ~2x; /proc/meminfo on Linux). Fresh machine: ceiling wins
-unchanged (16 GB -> 8, 64 GB -> 44 — community numbers unaffected); loaded machine:
-backs off instead of tipping over. Tests in tests/test_sysmem.py; README updated
-(headline table, scatter-fix bullet in Finding 2, 16 GB model guide, --budget flag
-row, quickstart numbers). REMAINING: re-run the standard bench suite + report.md /
-community-results comparisons on 0.9.x, and re-check the spec-decode arms (verify
-passes shared the same scatter tax, so M-vs-win thresholds shift toward greedy).
+**Budget formula RESOLVED same day (two iterations).** The user's live greedy sweep
+at temp 0 (4/5/6/8/10 GB = 1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s, 200 tokens)
+put the 16 GB optimum at 6 GB — an earlier 6-vs-8 comparison was confounded by
+--temp 1.0 on the 6 GB arm. Final formula in sysmem.py: `auto = 0.75 * (RAM - 8 GB)`,
+floor 2 GB — the FIXED 8 GB models the OS-plus-apps baseline (absolute, not
+proportional), and one formula now fits all calibration machines: 16 -> 6 (measured
+optimum), 64 -> 42 (community ran 44-58 fine), 128 -> 90 (community ran 90 fine).
+NOTE — availability clamp TRIED AND REVERTED: a first iteration clamped auto to
+`available - 1 GB` using macOS `memory_pressure -Q` free-percentage; in the user's
+real session it starved the budget to the 2 GB floor on a machine that ran fine at
+6 GB moments later — the kernel free-pct is too volatile mid-session to size a cache
+that macOS will happily make room for. Auto is a pure function of TOTAL RAM
+(deterministic, testable); loaded machines pass an explicit smaller --budget. Tests
+in tests/test_sysmem.py; README updated (headline 2.8-3.2 tok/s, scatter-fix bullet,
+16 GB model guide + --budget flag row with the sweep, quickstarts now use auto).
+REMAINING: re-run the standard bench suite + report.md / community-results
+comparisons on 0.9.x, and re-check the spec-decode arms (verify passes shared the
+same scatter tax, so M-vs-win thresholds shift toward greedy).
 Original finding follows.
 
 Original entry (pre-fix measurements):

@@ -16,7 +16,7 @@ then claws the speed back with three levers that only make sense in the disk-bou
 
 - **MoE expert streaming** — a Qwen3-30B-A3B token fires only 8 of 128 experts per layer.
   NunSpark loads *only those*, caches them expert-aware, and prefetches the ones the next
-  verify pass will probably fire. Measured on a 16 GB M4: **0.5 → 2.8 tok/s**, reading
+  verify pass will probably fire. Measured on a 16 GB M4: **0.5 → 3.2 tok/s**, reading
   ~100 MB/token instead of ~1 GB.
 - **Deep-K speculative decoding** — on disk-bound hardware the draft model's compute is free,
   so speculation can go far deeper (K=16–24) than GPU serving ever would. One weight sweep
@@ -31,7 +31,7 @@ then claws the speed back with three levers that only make sense in the disk-bou
 
 | Model (4-bit) | Size on disk | tok/s | How |
 |---|---|---|---|
-| Qwen3-30B-A3B (MoE) | 16 GB | **2.5–2.8** | expert streaming + expert-aware cache + persistent scatter buffers (0.9.x) |
+| Qwen3-30B-A3B (MoE) | 16 GB | **2.8–3.2** | expert streaming + expert-aware cache + persistent scatter buffers (0.9.x, auto budget 6 GB) |
 | Qwen3-30B-A3B (MoE) | 16 GB | **up to 1.54 speculative** | + deep-K spec (M≈7 on reasoning prompts; pre-scatter-fix number — re-benchmark pending) |
 | Qwen2.5-32B (dense) | 18 GB | **0.9–1.1** | streaming + deep-K spec |
 | Llama-3.3-70B (dense) | 40 GB | **~0.9** | streaming + deep-K spec |
@@ -44,11 +44,10 @@ hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality 
 
 ### Which model for your RAM
 
-- **16 GB** → `Qwen3-30B-A3B-4bit`, default `--budget auto` (2.5–2.8 tok/s greedy on a fresh
-  machine, where auto picks 8 GB). **More budget is not faster**: past the memory cliff the
-  cache fights the macOS compressor — a measured 6/8/10 GB sweep on a 16 GB M4 gave 2.52 /
-  2.84 / **1.33** tok/s. `auto` now watches available (not just total) RAM and backs off on a
-  loaded machine; pin an explicit budget only if you need run-to-run comparability.
+- **16 GB** → `Qwen3-30B-A3B-4bit`, default `--budget auto` (picks 6 GB — the measured
+  optimum, **3.2 tok/s greedy**). **More budget is not faster**: past the memory cliff the
+  cache fights the macOS compressor — a measured 4/5/6/8/10 GB sweep on a 16 GB M4 gave
+  1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s. When in doubt go lower, not higher.
 - **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit`
   with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` (community: 4.57 tok/s spec vs 3.39
   greedy on code at 64 GB/budget 48GB; 1.16 spec vs 0.10 greedy on a 32 GB M1 Pro at budget
@@ -66,7 +65,7 @@ deleted after packing):
 ```bash
 pip install nunspark
 nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
-nunspark generate ./packed/qwen3-30b --budget 8GB --max-tokens 200 --metrics \
+nunspark generate ./packed/qwen3-30b --max-tokens 200 --metrics \
   --prompt "Explain how a B-tree stays balanced."
 ```
 
@@ -130,8 +129,8 @@ Qwen3-30B-A3B fires 8 of 128 experts per layer, ~1 GB of expert weights per toke
   rebuilding zero-filled 128-expert buffers each layer (~15 GB of transient writes per token)
   just to host the 8 fired experts. The engine now keeps one persistent buffer set and
   scatter-updates only the fired rows — byte-identical output, and 30B decode on a 16 GB M4
-  went **1.6 → 2.5–2.8 tok/s** in live sessions (up to 3.2× in controlled flushed probes; see
-  `scripts/results/decode_time_attribution.json`).
+  went **1.6 → 3.2 tok/s** in live sessions (a 3.2× bucket-level speedup in controlled flushed
+  probes; see `scripts/results/decode_time_attribution.json`).
 
 Every one of those policies was chosen by measurement — the failed variants and their numbers
 are written up in [docs/](docs/) gate summaries.
@@ -296,7 +295,7 @@ Key flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`, or `auto`). Default `auto`: 75% of total RAM minus 4 GB, **clamped to currently-available RAM minus 1 GB** — so a loaded machine gets a smaller cache instead of one that fights the macOS compressor. The cliff is asymmetric (on a 16 GB M4 with the 30B: 2 GB under the optimum cost ~13%, 2 GB over it cost ~55%), so when in doubt go lower, not higher. Community numbers below were run with an explicit `--budget`; pin one yourself for comparable results. |
+| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`, or `auto`). Default `auto`: **75% of (total RAM − 8 GB)** — 16 GB → 6 GB, 64 GB → 42 GB, 128 GB → 90 GB. The fixed 8 GB reflects the OS-plus-apps baseline, which doesn't scale with RAM. **More budget is not faster**: past the memory cliff the cache fights the macOS compressor, and the cliff is asymmetric (a measured 4/5/6/8/10 GB sweep on a 16 GB M4 with the 30B gave 1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s) — when in doubt go lower, not higher. Community numbers below were run with an explicit `--budget`; pin one yourself for comparable results. |
 | `--kv-budget` | Resident KV-cache budget (default: unbounded). |
 | `--kv-bits {4,8}` | Quantize the KV cache (default fp16). |
 | `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations)). |
@@ -319,10 +318,11 @@ streaming only the experts each token actually fires:
 #    core piece + one piece per expert (~6200 files for Qwen3-30B-A3B).
 uv run nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
 
-# 2. Stream it. Greedy decode alone reaches ~2.5–2.8 tok/s at an 8 GB budget (0.9.x):
+# 2. Stream it. Greedy decode alone reaches ~3.2 tok/s at the default auto budget
+#    (6 GB on a 16 GB machine, 0.9.x):
 uv run nunspark generate ./packed/qwen3-30b \
   --prompt "Explain how a B-tree stays balanced." \
-  --budget 8GB --max-tokens 256 --metrics
+  --max-tokens 256 --metrics
 
 # 3. Add deep-K speculation. The draft (Qwen3-0.6B) shares Qwen3's tokenizer, so its
 #    proposals are valid target tokens; one 30B verify sweep then buys up to ~7 tokens.
@@ -331,7 +331,7 @@ uv run nunspark generate ./packed/qwen3-30b \
   --draft-model Qwen/Qwen3-0.6B \
   --num-draft-tokens 24 \
   --accept-top-k 1 \
-  --budget 8GB --max-tokens 256 --metrics
+  --max-tokens 256 --metrics
 ```
 
 With `--metrics` you'll see the acceptance multiplier M and the effective tok/s. Which mode
