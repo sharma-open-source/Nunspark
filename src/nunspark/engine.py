@@ -174,6 +174,7 @@ class StreamingEngine:
         expert_trace: str | Path | None = None,
         expert_cache_frac: float = 0.9,
         expert_prefetch: bool = True,
+        decode_bulk_warm: bool = False,
     ):
         self.manifest = manifest
         spec = get_architecture(manifest.model_type)
@@ -239,6 +240,14 @@ class StreamingEngine:
         # Set per forward() from the input token count (B*L); gates speculative
         # issuance to multi-token passes only (Defect 2, consume side).
         self._cur_pass_multi = False
+        # Opt-in probe (backlog: decode demand-parallel warm): extend the
+        # post-router bulk warm to SINGLE-token passes too. Off by default —
+        # Phase-1 measured predictive warming net-negative for decode; this flag
+        # exists to A/B the exact-miss (non-predictive) variant.
+        self._decode_bulk_warm = bool(decode_bulk_warm)
+        # Persistent full-size expert scatter buffers (see _scatter_experts);
+        # built lazily on first scatter, invalidated by _make_slot.
+        self._scatter_bufs: dict | None = None
         self._stall_seconds = 0.0    # cumulative router-output -> experts-resident wait
         self._block_factory = spec.block_factory
         self._layer_key_fn = spec.layer_key_fn
@@ -445,6 +454,9 @@ class StreamingEngine:
         built correctly; a uniformly-quantized checkpoint resolves every module to
         the base config, unchanged from before."""
         slot = self._block_factory(self.args, layer_idx)
+        # New structural variant => expert module shapes may differ; the
+        # persistent scatter buffers (built against the old shapes) are stale.
+        self._scatter_bufs = None
         if self._quant:
             kwargs = dict(
                 group_size=self._base_quant["group_size"],
@@ -482,12 +494,20 @@ class StreamingEngine:
         return fired if from_multi else []
 
     def _scatter_experts(self, slot, layer: int, fired: list[int]) -> None:
-        """Load only the `fired` experts and scatter their rows into full-size,
-        zero-filled expert-module buffers, then update the slot. Unfired rows stay
-        zero and are never gathered by the expert module's forward, so output is
-        bit-identical to loading all experts. Each piece's rows are copied in
-        immediately (scatter-then-discard), so a budget too small to keep pieces
-        resident is still correct."""
+        """Load only the `fired` experts and scatter their rows into full-size
+        PERSISTENT expert-module buffers, then update the slot. Unfired rows are
+        never gathered by the expert module's forward (it gathers exactly the
+        router's `inds`), so output is bit-identical to loading all experts —
+        which is also why the buffers need no re-zeroing between layers: a stale
+        row from a previous layer is exactly as unreachable as a zero row.
+        Rebuilding zero-filled buffers every layer of every token was measured at
+        59-70% of streaming decode wall time (~15 GB of transient writes per
+        token; scripts/results/decode_time_attribution.json) vs ~45 ms/token for
+        the persistent row-scatter (scripts/results/scatter_strategy_microbench
+        .json). Each piece's rows are still copied in immediately
+        (scatter-then-discard), so a budget too small to keep pieces resident is
+        still correct. The buffer set is invalidated in _make_slot whenever the
+        slot's structural variant (and thus the expert shapes) changes."""
         attr = self._expert_attr
         sw = getattr(slot.mlp, attr)
         subkeys = [
@@ -496,11 +516,13 @@ class StreamingEngine:
             for comp in ("weight", "scales", "biases", "bias")
             if comp in getattr(sw, proj)            # fp16: weight[,bias]; 4-bit: + scales/biases
         ]
-        bufs = {
-            (proj, comp): mx.zeros(getattr(sw, proj)[comp].shape,
-                                   dtype=getattr(sw, proj)[comp].dtype)
-            for proj, comp in subkeys
-        }
+        bufs = self._scatter_bufs
+        if bufs is None:
+            bufs = self._scatter_bufs = {
+                (proj, comp): mx.zeros(getattr(sw, proj)[comp].shape,
+                                       dtype=getattr(sw, proj)[comp].dtype)
+                for proj, comp in subkeys
+            }
         # Stall instrumentation (plan4 M3): wall time the expert loads spend on
         # cache.get misses (router-output -> experts-resident). The scatter
         # assignments below are lazy graph-builds; the real disk wait is inside
@@ -611,7 +633,7 @@ class StreamingEngine:
         # decode must stay untouched — its fired sets are small, M3 speculative
         # prefetch already covers that regime, and Phase-1 showed warming is
         # net-negative for decode.
-        if self._cur_pass_multi:
+        if self._cur_pass_multi or self._decode_bulk_warm:
             self.cache.warm_bulk(
                 Manifest.layer_expert_piece_id(layer, e) for e in fired)
         self._scatter_experts(slot, layer, fired)

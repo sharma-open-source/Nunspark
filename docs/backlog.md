@@ -151,6 +151,81 @@ fixtures do. The fourth (webapp test_run_generation_bad_output_dir_does_not_rais
 real unfixed behavior. All four are deselected in .github/workflows/tests.yml — remove
 the deselects when fixed.
 
+## 9. Decode demand-parallel warm — MEASURED 2026-07-17, no effect (do not revisit as-proposed)
+
+Community suggestion: a `get_many` batched demand load (thread-pool the post-router
+expert misses) at single-token decode, claiming 8 sequential misses/layer → ~256 ms
+serial I/O per token. Tried: `StreamingEngine(decode_bulk_warm=True)` (opt-in flag,
+default off) extends the existing `warm_bulk` to single-token passes; interleaved A/B
+with page-cache flushes (scripts/decode_bulkwarm_probe.py,
+scripts/results/decode_bulkwarm_ab.json). Result: control 0.767/1.079 vs warm
+0.891/0.854 tok/s — a wash inside run noise, token streams identical. Root cause the
+premise is wrong at our coverage: 30B@8GB decode misses ~17.4/token over 48 layers =
+**~0.36 misses per layer** — a missing layer almost always misses exactly ONE piece, so
+within-layer parallelism has nothing to parallelize. Consistent with Phase-1's "warming
+is net-negative for decode". The only way to get queue depth at decode is CROSS-LAYER:
+run layers L+1..L+3's (core-resident, tiny) router gates on layer L's hidden state,
+prefetch the predicted top-set into the M3a staging buffer — same-token residual-stream
+lookahead, much stronger prior than the shipped previous-token temporal prefetch
+(Jaccard ~0.30). Cheap offline go/no-go: instrument one forward pass, measure how often
+true top-8 at L+k lands in the L-state-predicted top-12 (k=1..3).
+
+## 10. Decode is NOT disk-bound: fix _scatter_experts full-buffer rebuild + budget cliff (FIX SHIPPED 2026-07-17 — budget sweep still open)
+
+**Outcome.** Persistent full-size scatter buffers (no re-zero; invalidated on
+_make_slot; strategy B of scripts/results/scatter_strategy_microbench.json) shipped in
+_scatter_experts. Post-fix, same flushed probes: **6 GB 1.342 → 4.235 tok/s (3.16×**,
+scatter bucket 524 → 73 ms/token); 8 GB 0.745 → 1.267 (1.70×, still compressor-
+limited). 150-token decode stream byte-identical to the pre-fix control; bitwise
+stale-row regression test in tests/test_scatter_persistent_bufs.py; full suite 355
+passed / same 4 known failures. **Project decode best on 16 GB: 2.5-2.8 tok/s live (user sweep), 4.2 in flushed
+controlled probes, vs the previous 1.6-1.65 headline.**
+
+**Budget formula RESOLVED same day (two iterations).** The user's live greedy sweep
+at temp 0 (4/5/6/8/10 GB = 1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s, 200 tokens)
+put the 16 GB optimum at 6 GB — an earlier 6-vs-8 comparison was confounded by
+--temp 1.0 on the 6 GB arm. Final formula in sysmem.py: `auto = 0.75 * (RAM - 8 GB)`,
+floor 2 GB — the FIXED 8 GB models the OS-plus-apps baseline (absolute, not
+proportional), and one formula now fits all calibration machines: 16 -> 6 (measured
+optimum), 64 -> 42 (community ran 44-58 fine), 128 -> 90 (community ran 90 fine).
+NOTE — availability clamp TRIED AND REVERTED: a first iteration clamped auto to
+`available - 1 GB` using macOS `memory_pressure -Q` free-percentage; in the user's
+real session it starved the budget to the 2 GB floor on a machine that ran fine at
+6 GB moments later — the kernel free-pct is too volatile mid-session to size a cache
+that macOS will happily make room for. Auto is a pure function of TOTAL RAM
+(deterministic, testable); loaded machines pass an explicit smaller --budget. Tests
+in tests/test_sysmem.py; README updated (headline 2.8-3.2 tok/s, scatter-fix bullet,
+16 GB model guide + --budget flag row with the sweep, quickstarts now use auto).
+REMAINING: re-run the standard bench suite + report.md / community-results
+comparisons on 0.9.x, and re-check the spec-decode arms (verify passes shared the
+same scatter tax, so M-vs-win thresholds shift toward greedy).
+Original finding follows.
+
+Original entry (pre-fix measurements):
+
+Attribution probe 2026-07-17 (scripts/decode_time_attribution_probe.py,
+scripts/results/decode_time_attribution.json), 30B, 100 greedy tokens, flushed:
+
+- **Expert demand-load wait is only 17–30% of decode.** The dominant bucket is
+  `_scatter_experts` EXCLUDING the disk wait: **789 ms/token at 8 GB (59%), 524 ms at
+  6 GB (70%)**. Structural cause: every MoE layer of every token builds FULL-SIZE
+  zero-filled buffers for all 128 experts (~312 MB/layer, ~15 GB of writes/token over
+  48 layers) to host ~8 fired experts, then `mx.eval`s it. The zero rows are never
+  gathered by the switch matmul — they are pure waste. Fix candidates: (a) compact
+  fired-only buffers with inds remapped to 0..k-1 (16x fewer bytes; needs a numerics
+  gate — cross-shape fp16 caution), (b) persistent slot buffers, scatter only the
+  fired rows, never re-zero (stale unfired rows are harmless because never gathered;
+  depends on MLX in-place/donation behavior for setitem-scatter). Upside ~2-3x decode.
+- **The 16 GB auto-budget (8 GB) is past the memory cliff:** 6 GB ran **1.80x faster**
+  (1.342 vs 0.745 tok/s) despite 2x the misses (41.6 vs 21.3/token); per-miss stall
+  18.7 ms vs 3.0 ms — at 8 GB the loads fight the macOS compressor. Sweep 5-7 GB and
+  revisit the auto formula for 16 GB machines (interacts with (a): smaller transient
+  buffers may move the cliff).
+- Host syncs (router tolist + per-layer eval) are ~10% — a native rewrite is NOT
+  supported by the data; the bottleneck is our buffer strategy, fixable in Python/MLX.
+- Also fixes/covers: the 40% run-to-run bench variance at 8 GB (pressure-dependent),
+  and the same scatter tax inside every spec verify pass and prefill window.
+
 ## 7. TensorFold adoptions — PROMOTED to Plan 5 (docs/plan5-tensorfold-adoptions.md)
 
 TensorFold (github.com/ashhart/TensorFold, MIT) — an independent MoE-streaming runtime
