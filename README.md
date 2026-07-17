@@ -1,5 +1,12 @@
 # NunSpark
 
+[![tests](https://github.com/sharma-open-source/Nunspark/actions/workflows/tests.yml/badge.svg)](https://github.com/sharma-open-source/Nunspark/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/nunspark)](https://pypi.org/project/nunspark/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey)](https://github.com/ml-explore/mlx)
+[![Built on MLX](https://img.shields.io/badge/built%20on-MLX-orange)](https://github.com/ml-explore/mlx)
+
 **Run LLMs that don't fit in your Mac's RAM — at usable speeds.**
 
 Your Mac has 16 GB of unified memory. The model you want needs 16–40 GB of weights. NunSpark
@@ -171,8 +178,31 @@ are written up in [docs/](docs/) gate summaries.
   GLM/GLM-4, OLMo-2, InternLM3, gpt-oss, and more. The current list is queryable in code via
   `nunspark.architectures.supported_model_types()`; `pack` will tell you if a model's
   `model_type` isn't supported. Multimodal models are not supported (text decoders only).
+  See the **Supported models** table below for the full list with per-family notes.
 
 Not built / deferred: TurboQuant 2–4 bit KV (blocked on upstream MLX SDPA support).
+
+### Supported models
+
+NunSpark streams any text decoder whose `model_type` is in the registry — 24 types today.
+It rides stock mlx_lm layer modules, so any quantization mlx-community publishes for these
+families (4-bit, 6-bit, 8-bit, fp16, mixed mxfp4) works as-is. `nunspark pack` fails with a
+clear message (and the full supported list) on anything unregistered; multimodal models are
+not supported (text decoders only).
+
+| `model_type` | Families / examples | Notes |
+|---|---|---|
+| `qwen3_moe` | Qwen3-30B-A3B, Qwen3-235B-A22B, Qwen3-Coder-480B | **Selective expert streaming** — the headline path; only fired experts are read per token. Field-verified from 30B (16 GB Mac) to 480B (128 GB, community). |
+| `gpt_oss` | gpt-oss-20b, gpt-oss-120b | Selective expert streaming + sliding-window attention. `--kv-bits` unsupported (attention sinks); excluded from web-UI batched decode (falls back to sequential). |
+| `llama`, `mistral` | Llama 3.x, SmolLM, Mistral 7B | Dense. Llama-3.3-70B field-verified on 32 GB; pair with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` for speculation (the draft must share the target's tokenizer). |
+| `qwen2`, `qwen3` | Qwen2.5 (0.5B–72B), Qwen3 dense (0.6B–32B) | Dense. Qwen3-0.6B is the default bench draft; Qwen2.5-32B field-verified. |
+| `gemma3`, `gemma3_text`, `gemma4`, `gemma4_text` | Gemma 3 / Gemma 4 | Heterogeneous (sliding + global) attention layers; excluded from web-UI batched decode. |
+| `gemma4_assistant` | Gemma 4 MTP assistant | Used as a feature-level drafter for Gemma 4 targets (multi-token prediction). |
+| `apertus`, `ernie4_5`, `glm`, `glm4`, `helium`, `hunyuan_v1_dense`, `internlm3`, `mimo`, `olmo2`, `phi3`, `seed_oss`, `telechat3`, `youtu_llm` | GLM-4, OLMo-2, Phi-3, InternLM3, ERNIE 4.5, Hunyuan, … | Dense, via the same registry path as llama/qwen (stock mlx_lm modules, verified bit-identical to full-load on CI fixtures). Fewer real-model field reports — results welcome in the community benchmark thread. |
+
+The authoritative list is `nunspark.architectures.supported_model_types()`; models with
+community-measured numbers are collected in
+[docs/community-results.md](docs/community-results.md).
 
 ## Requirements
 

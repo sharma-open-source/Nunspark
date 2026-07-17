@@ -227,6 +227,48 @@ Notes:
 - Matches the maintainer's M4 16 GB numbers at the same 8 GB budget (1.33–2.13 tok/s
   greedy) — the budget, not the machine's total RAM, governs MoE streaming speed.
 
+### Apple M1 Max, 64 GB RAM, macOS 26.3 — nunspark 0.8.0, mlx 0.32.0 (2026-07-17) — auto-budget rerun
+
+Same volunteer/machine as the 0.5.0 entry above, rerun on 0.8.0 with no `--budget`
+flag (auto resolved the budget; the report prints it as 47.2GB — that is 44 GiB
+= 0.75 x 64 GiB - 4 GiB rendered in decimal GB). Reproduced cleanly across two runs.
+
+| workload | mode | tok/s | M | expert hit% | MB/token | peak GB |
+|---|---|---|---|---|---|---|
+| code | greedy | 6.31 | — | 89.8 | 119 | 14.29 |
+| code | spec | 5.61 | 4.55 | 91.6 | 127 | 15.42 |
+| prose | greedy | 6.68 | — | 90.5 | 111 | 13.44 |
+| prose | spec | 5.62 | 4.35 | 91.9 | 116 | 14.28 |
+| reasoning | greedy | 6.71 | — | 89.7 | 120 | 14.46 |
+| reasoning | spec | 11.54 | 9.09 | 85.9 | 123 | 15.00 |
+
+settings: budget=47.2GB, max_tokens<=100, speculative=on, K=24
+
+Earlier same-config run (directionally consistent): code 6.15/4.84, prose 6.71/5.63,
+reasoning 6.67/10.62.
+
+Notes:
+- **Cross-MACHINE M determinism confirmed.** M = 4.55 / 4.35 / 9.09 — byte-identical
+  to the M1 Pro 32 GB 19-run study's values on the same model + draft + K=24, on
+  different hardware and a different budget. M is a property of the
+  model/draft/prompt/K, fully decoupled from timing, exactly as designed.
+- **0.8.0 fixed a speculative-run stall this volunteer hit on the older version**
+  (bench appeared to hang after loading the Qwen3-0.6B draft; their 0.5.0 entry above
+  ran spec-off for this reason). Root cause not isolated on our side — plausibly the
+  mid-run draft download (backlog #6 pre-download item) or the pre-0.6.0 prefill
+  behavior; worth remembering if another report mentions a "hang" on <=0.5.x.
+- **Coverage law holds at the RAM-resident end.** At a 44 GiB budget the 16 GB pack
+  fully fits (hit% ~90, MB/token ~120 vs 8 GB-budget ~285): greedy jumps 1.6 -> 6.3-6.7
+  tok/s vs their old 8 GB-budget run, and the spec arm only wins where M is huge —
+  reasoning +72% (M=9.09) — while code/prose spec (M~4.4) run ~11-16% SLOWER than
+  greedy, verify-compute-bound rather than disk-bound. Matches the maintainer's
+  RAM-resident finding (spec ~ +3% at M~4) and the break-even-at-M~4 analysis from the
+  235B report.
+- First field confirmation of 0.8.0 auto-budget on 64 GB (44 GiB, inside the 48-58 GB
+  range this volunteer had proven manually). Cosmetic: the report's GiB-vs-decimal-GB
+  rendering ("47.2GB" for 44 GiB) may confuse readers comparing against the
+  "75% - 4GB" formula — candidate one-line fix in bench formatting.
+
 ---
 
 ## Maintainer reference (Apple M4, 16 GB RAM, 460 GB SSD)

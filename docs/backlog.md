@@ -139,6 +139,18 @@ From the M1 Pro 32 GB 19-run study + follow-up comment (docs/community-results.m
   M diverging across machines/runs on the same model+draft+K indicates a real bug, not
   noise.
 
+## 8. Fix the 4 known test failures (LOW, test-infra)
+
+Root cause found 2026-07-17 while setting up CI: the three tests/test_cli.py failures
+(pack_then_generate, kv_budget_arg_accepted, io_warmer_flags_bit_identical) are NOT
+missing optional deps — transformers' "install sentencepiece or tiktoken" error is
+misleading (both installed, still fails). The tiny_model_dir fixture ships only a slow
+tokenizer that current transformers can no longer convert to a fast one; fix = have the
+fixture write a `tokenizer.json` (tokenizers-library serialization) like the other
+fixtures do. The fourth (webapp test_run_generation_bad_output_dir_does_not_raise) is a
+real unfixed behavior. All four are deselected in .github/workflows/tests.yml — remove
+the deselects when fixed.
+
 ## 7. TensorFold adoptions — PROMOTED to Plan 5 (docs/plan5-tensorfold-adoptions.md)
 
 TensorFold (github.com/ashhart/TensorFold, MIT) — an independent MoE-streaming runtime
