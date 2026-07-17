@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "version*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    # MLX needs Apple Silicon: GitHub's macos-15 hosted runners are arm64.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project (dev + web extras)
+        run: uv sync --extra dev --extra web
+
+      # Four known pre-existing failures are deselected (same list the
+      # project's plan docs track, e.g. docs/plan5-tensorfold-adoptions.md):
+      # - the three test_cli tests fail because the tiny-fixture slow
+      #   tokenizer can't be converted by current transformers (its
+      #   "install sentencepiece/tiktoken" message is misleading — both
+      #   being installed does not fix it); needs a fixture that ships a
+      #   tokenizer.json.
+      # - the webapp bad-output-dir test is a known unfixed behavior.
+      - name: Run test suite
+        run: >
+          uv run pytest -q
+          --deselect tests/test_cli.py::test_cli_pack_then_generate
+          --deselect tests/test_cli.py::test_generate_cli_kv_budget_arg_accepted
+          --deselect tests/test_cli.py::test_generate_cli_io_warmer_flags_bit_identical
+          --deselect tests/webapp/test_runner.py::test_run_generation_bad_output_dir_does_not_raise

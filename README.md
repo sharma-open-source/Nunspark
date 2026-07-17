@@ -1,5 +1,12 @@
 # NunSpark
 
+[![tests](https://github.com/sharma-open-source/Nunspark/actions/workflows/tests.yml/badge.svg)](https://github.com/sharma-open-source/Nunspark/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/nunspark)](https://pypi.org/project/nunspark/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey)](https://github.com/ml-explore/mlx)
+[![Built on MLX](https://img.shields.io/badge/built%20on-MLX-orange)](https://github.com/ml-explore/mlx)
+
 **Run LLMs that don't fit in your Mac's RAM — at usable speeds.**
 
 Your Mac has 16 GB of unified memory. The model you want needs 16–40 GB of weights. NunSpark
