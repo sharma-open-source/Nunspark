@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .archspec import KVQuant, Rotating
+from .archspec import KVQuant, Rotating, cache_offset
 from .kv_store import KVStore
 
 
@@ -74,7 +74,7 @@ class PrefixCache:
         trimming the store or the claim, never trusting either alone."""
         if self.kv is None or self._probe_layer is None:
             return
-        actual = self.kv.get(self._probe_layer).offset
+        actual = cache_offset(self.kv.get(self._probe_layer))
         if actual > len(tokens):
             if self._rotated(actual):
                 # Trimming a rotated sliding-window cache decrements its

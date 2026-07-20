@@ -3,6 +3,8 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx_lm.models import (
     apertus,
+    deepseek_v32,
+    glm_moe_dsa,
     ernie4_5,
     glm,
     glm4,
@@ -30,10 +32,12 @@ from . import gemma4_assistant
 
 from .archspec import (
     ArchSpec,
+    ArrayCausal,
     DEFAULT_RUNNER,
     KV,
     LayerContext,
     LayerRunner,
+    Paired,
     PerLayer,
     Rotating,
 )
@@ -62,7 +66,10 @@ from .archspec import (
 #   * stablelm/starcoder2-> LayerNorm final norm
 #   * qwen3_next, mamba,  -> linear-attention / recurrent caches (no KVCache)
 #     rwkv7, plamo2, ...
-#   * deepseek/dbrx/MLA   -> MLA cache and/or non-qwen3 MoE weight layout
+#   * dbrx / older deepseek -> MLA cache and/or non-qwen3 MoE weight layout
+#     (deepseek_v32 / glm_moe_dsa ARE supported: their CacheList(latent,
+#     indexer) cache and array mask ship as first-class archspec kinds —
+#     Paired / ArrayCausal — and the decoder block is otherwise contract-clean)
 #   * *_vl / multimodal   -> vision towers the streamer doesn't run
 
 
@@ -115,6 +122,47 @@ def _gpt_oss_route(args, gate_logits):
     selected = mx.take_along_axis(gate_logits, inds, axis=-1)
     scores = mx.softmax(selected, axis=-1, precise=True)
     return inds, scores
+
+
+# --- deepseek_v32 / glm_moe_dsa helpers --------------------------------------
+
+def _deepseek_v32_layer_key(args, layer_idx: int) -> str:
+    """'moe' or 'dense' for a DeepseekV32DecoderLayer index — mirrors the
+    block's own mlp choice (first_k_dense_replace leading dense layers)."""
+    if (
+        args.n_routed_experts is not None
+        and layer_idx >= args.first_k_dense_replace
+        and layer_idx % args.moe_layer_freq == 0
+    ):
+        return "moe"
+    return "dense"
+
+
+def _deepseek_v32_route(args, gate_out):
+    """deepseek's MoEGate is not a logits-producing nn.Linear: its __call__
+    already runs the full noaux_tc selection (sigmoid + e_score_correction_bias
+    + optional group select + routed_scaling_factor, fp32) and returns
+    (indices, scores) — so the route hook is a pass-through, reusing the stock
+    group_expert_select math bit-for-bit."""
+    return gate_out
+
+
+def _deepseek_v32_spec(args_cls: type) -> ArchSpec:
+    return ArchSpec(
+        args_cls=args_cls,
+        block_factory=deepseek_v32.DeepseekV32DecoderLayer,  # (args, layer_idx) callable
+        layer_key_fn=_deepseek_v32_layer_key,
+        selective_moe=True,
+        expert_attr="switch_mlp",
+        router_attr="gate",
+        num_experts=lambda args: args.n_routed_experts,
+        moe_route=_deepseek_v32_route,
+        shared_experts_attr="shared_experts",
+        moe_mix_cast=True,       # MoEGate scores are fp32; reference casts the mix back
+        mask_plan=lambda args: ArrayCausal(),
+        cache_plan=lambda args: [Paired(2)] * args.num_hidden_layers,
+        supports_quantized_kv=False,   # MLA latent + indexer caches, not per-head K/V
+    )
 
 
 # --- gemma3 / gemma3_text helpers -------------------------------------------
@@ -399,6 +447,12 @@ _ARCH: dict[str, ArchSpec] = {
         moe_route=_gpt_oss_route,
         supports_quantized_kv=False,   # gpt_oss attention sinks; quantized SDPA raises
     ),
+    # --- deepseek_v32 / glm_moe_dsa (MLA + DSA sparse indexer + shared-expert MoE) ---
+    # GLM-5.2's glm_moe_dsa is a thin args wrapper over the deepseek_v32 block
+    # in mlx-lm; both use CacheList(latent, indexer-key) caches (Paired kind)
+    # and an array causal mask (ArrayCausal — the indexer needs mx.where).
+    "deepseek_v32": _deepseek_v32_spec(deepseek_v32.ModelArgs),
+    "glm_moe_dsa": _deepseek_v32_spec(glm_moe_dsa.ModelArgs),
     # --- gemma3 / gemma3_text (sliding window + Gemma norm) ---
     # NOTE: Both gemma3 and gemma3_text use gemma3_text.ModelArgs because the base
     # gemma3 is multimodal with only vocab_size; the real transformer config is in text_config.

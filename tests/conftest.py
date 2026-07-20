@@ -9,6 +9,7 @@ from mlx_lm.models.llama import Model, ModelArgs
 from mlx_lm.models.qwen3 import Model as Qwen3Model, ModelArgs as Qwen3ModelArgs
 from mlx_lm.models.qwen3_moe import Model as Qwen3MoeModel, ModelArgs as Qwen3MoeModelArgs
 from mlx_lm.models.gpt_oss import Model as GptOssModel, ModelArgs as GptOssModelArgs
+from mlx_lm.models.glm_moe_dsa import Model as GlmMoeDsaModel, ModelArgs as GlmMoeDsaModelArgs
 
 
 TINY_CONFIG = {
@@ -278,6 +279,90 @@ def tiny_qwen3_moe_quant_model_dir(tmp_path) -> Path:
     out = tmp_path / "tiny-qwen3-moe-q4"
     out.mkdir()
     config = {**TINY_QWEN3_MOE_CONFIG, "quantization": {"group_size": 64, "bits": 4}}
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+
+    flat = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(out / "model.safetensors"), flat)
+    return out
+
+
+TINY_GLM_MOE_DSA_CONFIG = {
+    "model_type": "glm_moe_dsa",
+    "vocab_size": 320,
+    "hidden_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "intermediate_size": 128,
+    # MLA — dims chosen so every quantized axis divides group_size 32
+    "q_lora_rank": 64,
+    "kv_lora_rank": 32,
+    "qk_nope_head_dim": 32,
+    "qk_rope_head_dim": 16,
+    "v_head_dim": 32,
+    "attention_bias": False,
+    # DSA indexer — index_topk tiny so tests exercise BOTH regimes: prompts
+    # <= 8 run exact full attention, anything longer fires the sparse top-k
+    # path (the real GLM-5.2 threshold is 2048; the code path is the same)
+    "index_head_dim": 32,
+    "index_n_heads": 2,
+    "index_topk": 8,
+    # MoE — layer 0 dense, layers 1..3 MoE (first_k_dense_replace), one
+    # always-on shared expert, sigmoid/noaux_tc routing like GLM-5.2
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 64,
+    "moe_layer_freq": 1,
+    "first_k_dense_replace": 1,
+    "routed_scaling_factor": 2.5,
+    "topk_method": "noaux_tc",
+    "scoring_func": "sigmoid",
+    "norm_topk_prob": True,
+    "n_group": 1,
+    "topk_group": 1,
+    "max_position_embeddings": 512,
+    "rms_norm_eps": 1e-5,
+    # GLM-5.2-style rope_parameters dict (glm_moe_dsa.ModelArgs derives
+    # rope_theta/rope_scaling from it in __post_init__)
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+}
+
+
+@pytest.fixture
+def tiny_glm_moe_dsa_model_dir(tmp_path) -> Path:
+    """A seeded random tiny glm_moe_dsa (GLM-5.2-style MLA + DSA indexer +
+    shared-expert MoE) saved as an mlx-lm model dir."""
+    mx.random.seed(0)
+    model = GlmMoeDsaModel(GlmMoeDsaModelArgs.from_dict(TINY_GLM_MOE_DSA_CONFIG))
+    mx.eval(model.parameters())
+
+    out = tmp_path / "tiny-glm-moe-dsa"
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps(TINY_GLM_MOE_DSA_CONFIG, indent=2))
+
+    flat = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(out / "model.safetensors"), flat)
+    return out
+
+
+@pytest.fixture
+def tiny_glm_moe_dsa_quant_model_dir(tmp_path) -> Path:
+    """A 4-bit tiny glm_moe_dsa. group_size=32 because the narrowest quantized
+    axes (qk_nope_head_dim=32 for embed_q, kv_lora_rank=32 for unembed_out)
+    only divide 32. e_score_correction_bias and MoEGate.weight are raw params
+    on modules without to_quantized, so nn.quantize leaves them untouched —
+    same as mlx_lm convert on the real checkpoint."""
+    mx.random.seed(0)
+    model = GlmMoeDsaModel(GlmMoeDsaModelArgs.from_dict(TINY_GLM_MOE_DSA_CONFIG))
+    mx.eval(model.parameters())
+    nn.quantize(model, group_size=32, bits=4)
+    mx.eval(model.parameters())
+
+    out = tmp_path / "tiny-glm-moe-dsa-q4"
+    out.mkdir()
+    config = {**TINY_GLM_MOE_DSA_CONFIG,
+              "quantization": {"group_size": 32, "bits": 4}}
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
     flat = dict(tree_flatten(model.parameters()))

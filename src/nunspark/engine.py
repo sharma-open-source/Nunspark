@@ -9,10 +9,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map, tree_unflatten
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
-from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
+from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache, RotatingKVCache
 
 from .architectures import get_architecture
-from .archspec import LayerContext, UniformCausal, _ConstMask
+from .archspec import LayerContext, UniformCausal, _ConstMask, cache_offset
 from .manifest import Manifest
 from .piece_store import PieceStore
 from .piece_cache import PieceCache
@@ -124,6 +124,8 @@ def _clone_kv_cache(pcache):
             c.state = tree_map(lambda x: x[:], pcache.state)
             c.offset = pcache.offset    # state setter doesn't set it
         return c
+    if isinstance(pcache, CacheList):
+        return CacheList(*(_clone_kv_cache(c) for c in pcache.caches))
     c = KVCache()
     if pcache.keys is not None:
         pk, pv = pcache.state           # sliced to offset; setter derives offset
@@ -152,6 +154,28 @@ class _RecordingCache:
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
+
+
+class _RecordingCacheList:
+    """CacheList counterpart of _RecordingCache: each child clone gets its own
+    recorder, exposed via __getitem__ — deepseek_v32-style attention reaches
+    the sub-caches by index (cache[0] latent, cache[1] indexer keys), which
+    plain attribute delegation cannot forward (dunder lookup is on the type).
+    `commit_verified` walks `children` to append each sub-cache's accepted rows
+    through the persistent sub-cache's own update_and_fetch."""
+
+    def __init__(self, inner):
+        self.children = [_RecordingCache(c) for c in inner.caches]
+
+    def __getitem__(self, idx):
+        return self.children[idx]
+
+
+def _record(clone):
+    """Wrap an ephemeral verify-pass cache clone in its recorder type."""
+    if isinstance(clone, CacheList):
+        return _RecordingCacheList(clone)
+    return _RecordingCache(clone)
 
 
 class StreamingEngine:
@@ -284,6 +308,8 @@ class StreamingEngine:
             spec.num_experts(self.args) if spec.num_experts else getattr(self.args, "num_experts", None)
         )
         self._moe_route = spec.moe_route or _default_moe_route
+        self._shared_experts_attr = spec.shared_experts_attr
+        self._moe_mix_cast = spec.moe_mix_cast
 
         # opt-in expert-trace instrumentation (M1 locality measurement). Off by
         # default: _trace_fh stays None, so _moe_layer_forward pays one `if` check
@@ -649,8 +675,14 @@ class StreamingEngine:
             self._fired_history[layer] = (fired, batch_tokens > 1)
 
         y = getattr(slot.mlp, self._expert_attr)(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-        return h + y
+        mix = (y * scores[..., None]).sum(axis=-2)
+        if self._moe_mix_cast:
+            # deepseek-style routers emit fp32 scores; the reference casts the
+            # scored sum back to the expert output dtype before the residual.
+            mix = mix.astype(y.dtype)
+        if self._shared_experts_attr is not None:
+            mix = mix + getattr(slot.mlp, self._shared_experts_attr)(x)
+        return h + mix
 
     def _maybe_reset_prefetch(self, kv) -> None:
         """Drop the remembered fired-expert history at a new generation's start.
@@ -661,7 +693,7 @@ class StreamingEngine:
         if not self._expert_prefetch or kv is None:
             return
         try:
-            if kv.get(0).offset == 0:
+            if cache_offset(kv.get(0)) == 0:
                 self._fired_history.clear()
         except Exception:
             pass
@@ -698,7 +730,7 @@ class StreamingEngine:
         `batched_generate` before any forward, so no per-layer windowed pad mask
         is ever needed here.
         """
-        offset = kv.get(0).offset if kv is not None else 0
+        offset = cache_offset(kv.get(0)) if kv is not None else 0
         mask = create_causal_mask(h.shape[1], offset, left_padding=pad_lengths)
         return _ConstMask(mask)
 
@@ -810,6 +842,14 @@ class StreamingEngine:
         Requires `kv` to have been prefilled to `prefix_len` tokens (via `forward`);
         each layer's prefix KV is read to seed the ephemeral batched cache.
         """
+        from .archspec import Paired
+        if self.cache_kinds is not None and any(
+                isinstance(k, Paired) for k in self.cache_kinds):
+            raise ValueError(
+                f"{self.manifest.model_type} uses paired per-layer caches "
+                "(CacheList: MLA latent + DSA indexer); tree_forward's ephemeral "
+                "batched-cache seeding is written for single KVCache layers — "
+                "use the sequential speculative_generate path instead")
         self.cache.begin_pass()   # advance the speculative-protection epoch (one per pass)
         self._lctx.shared_kv.clear()
         self._lctx.target_kv_states.clear()
@@ -924,7 +964,7 @@ class StreamingEngine:
         recs: list[_RecordingCache] = []
         n = self.manifest.num_layers
         for layer in range(n):
-            rec = _RecordingCache(_clone_kv_cache(kv.get(layer)))
+            rec = _record(_clone_kv_cache(kv.get(layer)))
             recs.append(rec)
             if self.manifest.has_piece(Manifest.layer_core_piece_id(layer)):
                 h = self._moe_layer_forward(h, masks[layer], kv, layer,
@@ -961,6 +1001,12 @@ class StreamingEngine:
         if accepted_len <= 0:
             return
         for layer, rec in enumerate(recs):
+            if isinstance(rec, _RecordingCacheList):
+                for child, pcache in zip(rec.children, kv.get(layer).caches):
+                    k, v = child.recorded
+                    pcache.update_and_fetch(
+                        k[..., :accepted_len, :], v[..., :accepted_len, :])
+                continue
             k, v = rec.recorded
             kv.get(layer).update_and_fetch(
                 k[..., :accepted_len, :], v[..., :accepted_len, :])

@@ -5,7 +5,7 @@ from typing import Any, Callable, Protocol
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
+from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache, RotatingKVCache
 
 
 # --- mask planning --------------------------------------------------------
@@ -50,16 +50,39 @@ class Rotating:
     window: int
 
 
+@dataclass(frozen=True)
+class Paired:
+    """CacheKind for a layer holding N independent KVCaches in a CacheList —
+    deepseek_v32/glm_moe_dsa: [0] the MLA latent cache, [1] the DSA indexer's
+    key cache. Children are always plain KVCache: the MLA latent path stores a
+    compressed latent (not per-head K/V) and the indexer cache abuses `values`
+    as a zero-width placeholder, so KV-quantization is meaningless for both
+    (the owning ArchSpec sets supports_quantized_kv=False)."""
+    n: int = 2
+
+
+def cache_offset(cache) -> int:
+    """The sequence offset of a per-layer cache, CacheList-aware. A CacheList's
+    children advance in lockstep (one update_and_fetch each per forward), so the
+    first child's offset IS the layer's offset."""
+    return cache[0].offset if isinstance(cache, CacheList) else cache.offset
+
+
 def make_cache(kind, quant: KVQuant | None = None):
     """Build a fresh mlx cache for a CacheKind. None or KV -> KVCache
     (QuantizedKVCache when `quant` is set); Rotating(window) ->
-    RotatingKVCache(max_size=window, keep=0), always fp16."""
+    RotatingKVCache(max_size=window, keep=0), always fp16; Paired(n) ->
+    CacheList of n plain KVCaches (never quantized)."""
     if kind is None or kind == KV:
         if quant is not None:
             return QuantizedKVCache(group_size=quant.group_size, bits=quant.bits)
         return KVCache()
     if isinstance(kind, Rotating):
         return RotatingKVCache(max_size=kind.window, keep=0)
+    if isinstance(kind, Paired):
+        if quant is not None:
+            raise ValueError("Paired cache layers do not support KV quantization")
+        return CacheList(*(KVCache() for _ in range(kind.n)))
     raise ValueError(f"unknown CacheKind: {kind!r}")
 
 
@@ -78,6 +101,24 @@ class UniformCausal:
     def build(self, h: mx.array, kv) -> MaskIndex:
         cache0 = kv.get(0) if kv is not None else None
         return _ConstMask(create_attention_mask(h, cache0))
+
+
+@dataclass(frozen=True)
+class ArrayCausal:
+    """One global causal mask as an ARRAY, built from layer 0's first
+    sub-cache — deepseek_v32/glm_moe_dsa. The DSA indexer applies the mask
+    with `mx.where` and the L>1 sparse path intersects it with a boolean
+    top-k mask, so the "causal" string sentinel is unusable; mirrors the
+    stock model's
+        create_attention_mask(h, cache[0][0] if cache[0] else None,
+                              return_array=True)
+    where each layer's cache is a CacheList and [0] is the MLA latent cache.
+    """
+
+    def build(self, h: mx.array, kv) -> MaskIndex:
+        cache0 = kv.get(0) if kv is not None else None
+        inner = cache0[0] if cache0 is not None else None
+        return _ConstMask(create_attention_mask(h, inner, return_array=True))
 
 
 class _ListMask:
@@ -191,6 +232,10 @@ class ArchSpec:
     num_experts: Callable | None = None            # (args) -> int; None => args.num_experts
     moe_route: Callable | None = None              # (args, gate_logits) -> (indices, scores);
                                                     # None => qwen3-style softmax -> top-k -> optional renorm
+    shared_experts_attr: str | None = None         # always-on expert module under .mlp, added
+                                                    # to the routed mix (deepseek-style); None => absent
+    moe_mix_cast: bool = False                     # cast the scored expert sum back to the expert
+                                                    # output dtype (deepseek: scores are fp32)
     # declarative forward hooks (None => llama default):
     embed_scale: Callable | None = None           # (args) -> float | None
     final_norm: Callable | None = None            # (args) -> nn.Module

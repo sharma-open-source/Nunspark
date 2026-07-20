@@ -239,3 +239,27 @@ result — previous-token expert prefetch is a net slowdown (~43% consecutive-to
 overlap) — independently confirms our Phase-1 verdict; do not revisit. Their KV
 checkpoint w/ suffix-only prefill validates #2; when building #2, copy their
 `usage.prompt_tokens_details.cached_tokens` reporting.
+
+## 11. GLM-5.2 / deepseek_v32 follow-ups (Plan 6 M0–M4 shipped 2026-07-20)
+
+Streaming support for `glm_moe_dsa` (GLM-5.2) and `deepseek_v32` landed —
+see docs/plan6-glm52.md for gates. Deliberately deferred:
+
+- **Batched decode + tree spec for Paired-cache archs.** Both refuse with a
+  clear ValueError today (`_reject_rotating`-style gate; `tree_forward`
+  raises). Enabling them means teaching the batched row bookkeeping and
+  ephemeral batched-cache seeding about CacheList children. Do only if a
+  real GLM-5.2/DSV3.2 batched use case shows up.
+- **GLM-5.2 MTP layer as an EAGLE-style drafter.** The checkpoint ships one
+  nextn layer (dropped at pack time by mlx-lm sanitize). Same shape as the
+  gemma4_assistant story; the eagle_drafter/tree_spec seams exist but tree
+  spec is gated off for Paired archs (above), so this needs that first.
+- **Real-model numbers.** No perf claims exist anywhere for these archs and
+  none may be added until measured (community bench or a high-RAM Mac run).
+  Active set is ~39B params/token: expect usable speeds only where most of
+  the 8/256-expert working set stays RAM-resident; 16 GB Macs will crawl.
+- **IndexShare fidelity note.** mlx-lm's implementation runs the indexer
+  per-layer and ignores GLM-5.2's `index_topk_freq`/`index_skip_topk_offset`
+  IndexShare scheduling fields. NunSpark matches mlx-lm bit-for-bit (that is
+  our losslessness contract), so any fidelity question past 2048-token
+  contexts is upstream's to resolve; re-check when mlx-lm updates.
