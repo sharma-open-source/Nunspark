@@ -122,10 +122,11 @@ def test_unknown_model_type_raises_valueerror():
 
 def test_supported_model_types_is_sorted_list():
     assert supported_model_types() == [
-        "apertus", "ernie4_5", "gemma3", "gemma3_text", "gemma4", "gemma4_assistant",
-        "gemma4_text", "glm", "glm4", "gpt_oss", "helium", "hunyuan_v1_dense",
-        "internlm3", "llama", "mimo", "mistral", "olmo2", "phi3", "qwen2",
-        "qwen3", "qwen3_moe", "seed_oss", "telechat3", "youtu_llm",
+        "apertus", "deepseek_v32", "ernie4_5", "gemma3", "gemma3_text", "gemma4",
+        "gemma4_assistant", "gemma4_text", "glm", "glm4", "glm_moe_dsa", "gpt_oss",
+        "helium", "hunyuan_v1_dense", "internlm3", "llama", "mimo", "mistral",
+        "olmo2", "phi3", "qwen2", "qwen3", "qwen3_moe", "seed_oss", "telechat3",
+        "youtu_llm",
     ]
 
 

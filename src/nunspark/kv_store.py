@@ -7,14 +7,17 @@ from pathlib import Path
 from typing import Iterable
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache
 
 from .archspec import KVQuant, make_cache
 
 
 def _cache_nbytes(cache) -> int:
     """cache.nbytes, but 0 for a cache that has no buffers yet —
-    QuantizedKVCache.nbytes raises AttributeError before the first append."""
+    QuantizedKVCache.nbytes raises AttributeError before the first append.
+    A CacheList (Paired kind) reports the sum of its children."""
+    if isinstance(cache, CacheList):
+        return sum(_cache_nbytes(c) for c in cache.caches)
     if getattr(cache, "keys", None) is None:
         return 0
     return int(cache.nbytes)
@@ -193,7 +196,19 @@ class KVStore:
     def _load_cache(self, layer: int) -> KVCache:
         if layer in self._offloaded:
             d = mx.load(str(self._file(layer)))
-            if "_qmeta" in d:                    # a quantized layer
+            if "_list_n" in d:                   # a Paired (CacheList) layer
+                cache = self._new_cache(layer)   # CacheList of the right arity
+                state = []
+                for i in range(int(d["_list_n"][0])):
+                    k = d[f"list{i}_keys"]
+                    v = d.get(f"list{i}_values")
+                    if v is None:                # zero-width values (indexer cache)
+                        v = mx.zeros(tuple(d[f"list{i}_vshape"].tolist()), dtype=k.dtype)
+                    state.append((k, v))
+                cache.state = state
+                mx.eval(*(c.keys for c in cache.caches),
+                        *(c.values for c in cache.caches))
+            elif "_qmeta" in d:                  # a quantized layer
                 cache = QuantizedKVCache()
                 cache.state = (
                     (d["keys_q"], d["keys_scales"], d["keys_biases"]),
@@ -231,7 +246,23 @@ class KVStore:
             if nb == 0:
                 self._resident.pop(layer)        # empty: drop; reloads as fresh+empty
                 continue
-            if isinstance(cache, QuantizedKVCache):
+            if isinstance(cache, CacheList):
+                # Paired kind: children are plain KVCaches. Flatten each child's
+                # (keys, values) with an index prefix; "_list_n" marks the file
+                # so _load_cache rebuilds the right shape. A child's values may
+                # be zero-width (the DSA indexer cache stores no values) — that
+                # round-trips through safetensors as an ordinary 0-dim-axis array.
+                payload = {"_list_n": mx.array([len(cache.caches)])}
+                for i, c in enumerate(cache.caches):
+                    k, v = c.state
+                    payload[f"list{i}_keys"] = k
+                    if v.size > 0:
+                        payload[f"list{i}_values"] = v
+                    else:
+                        # safetensors refuses empty arrays; keep the shape so
+                        # _load_cache can rebuild the zero-width placeholder.
+                        payload[f"list{i}_vshape"] = mx.array(v.shape)
+            elif isinstance(cache, QuantizedKVCache):
                 (kq, ks, kb), (vq, vs, vb) = cache.state
                 payload = {
                     "keys_q": kq, "keys_scales": ks, "keys_biases": kb,

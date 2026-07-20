@@ -193,7 +193,7 @@ Not built / deferred: TurboQuant 2–4 bit KV (blocked on upstream MLX SDPA supp
 
 ### Supported models
 
-NunSpark streams any text decoder whose `model_type` is in the registry — 24 types today.
+NunSpark streams any text decoder whose `model_type` is in the registry — 26 types today.
 It rides stock mlx_lm layer modules, so any quantization mlx-community publishes for these
 families (4-bit, 6-bit, 8-bit, fp16, mixed mxfp4) works as-is. `nunspark pack` fails with a
 clear message (and the full supported list) on anything unregistered; multimodal models are
@@ -203,6 +203,7 @@ not supported (text decoders only).
 |---|---|---|
 | `qwen3_moe` | Qwen3-30B-A3B, Qwen3-235B-A22B, Qwen3-Coder-480B | **Selective expert streaming** — the headline path; only fired experts are read per token. Field-verified from 30B (16 GB Mac) to 480B (128 GB, community). |
 | `gpt_oss` | gpt-oss-20b, gpt-oss-120b | Selective expert streaming + sliding-window attention. `--kv-bits` unsupported (attention sinks); excluded from web-UI batched decode (falls back to sequential). |
+| `glm_moe_dsa`, `deepseek_v32` | GLM-5.2 (744B/39B-active), DeepSeek-V3.2 | Selective expert streaming + MLA latent-KV + DSA sparse-attention indexer. Sequential generate/speculative paths only (batched decode and tree spec refuse cleanly); `--kv-bits` unsupported (latent cache). Verified bit-identical to full-load on CI fixtures; no real-model performance measurements yet — the ~39B-active working set wants a high-RAM Mac, and community reports are welcome. |
 | `llama`, `mistral` | Llama 3.x, SmolLM, Mistral 7B | Dense. Llama-3.3-70B field-verified on 32 GB; pair with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` for speculation (the draft must share the target's tokenizer). |
 | `qwen2`, `qwen3` | Qwen2.5 (0.5B–72B), Qwen3 dense (0.6B–32B) | Dense. Qwen3-0.6B is the default bench draft; Qwen2.5-32B field-verified. |
 | `gemma3`, `gemma3_text`, `gemma4`, `gemma4_text` | Gemma 3 / Gemma 4 | Heterogeneous (sliding + global) attention layers; excluded from web-UI batched decode. |

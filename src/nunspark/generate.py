@@ -194,13 +194,19 @@ def _reject_rotating(engine: StreamingEngine) -> None:
     bookkeeping (_idx, window-clamped masks) is written for a single sequence and
     gives no correct B>1 ragged-length behavior, so these archs are gated OUT of
     v1. Checked BEFORE any forward so a bad arch fails cheaply and clearly."""
-    from .archspec import Rotating
+    from .archspec import Paired, Rotating
     kinds = engine.cache_kinds
     if kinds is not None and any(isinstance(k, Rotating) for k in kinds):
         raise ValueError(
             f"{engine.manifest.model_type} uses sliding-window attention "
             "(RotatingKVCache); batched_generate supports full-attention archs "
             "only (drop it to the sequential generate() path)")
+    if kinds is not None and any(isinstance(k, Paired) for k in kinds):
+        raise ValueError(
+            f"{engine.manifest.model_type} uses paired per-layer caches "
+            "(CacheList: MLA latent + DSA indexer); batched_generate's shared-"
+            "offset row bookkeeping is written for single KVCache layers "
+            "(drop it to the sequential generate() path)")
 
 
 def _prefill_batched(
