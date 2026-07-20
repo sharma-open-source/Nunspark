@@ -73,12 +73,13 @@ def _encode(tokenizer, prompt: str) -> list[int]:
 
 def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, mode: str,
             *, budget_bytes: int, max_tokens: int, draft_tokens: int,
-            draft_model=None, drafter=None) -> dict:
+            draft_model=None, drafter=None, lookahead: bool = False) -> dict:
     """Build a FRESH engine for this run (independent cache stats / peak memory),
     stream up to max_tokens greedy or speculative tokens via the existing
     generate() entry points, and return a metrics dict. Mirrors
     scripts/m1_baseline.py:_run_one."""
-    engine = StreamingEngine(packed, manifest, budget_bytes=budget_bytes)
+    engine = StreamingEngine(packed, manifest, budget_bytes=budget_bytes,
+                             lookahead_prefetch=lookahead)
     try:
         mx.reset_peak_memory()
         spec_stats = SpecStats() if mode in ("spec", "ngram-spec") else None
@@ -119,6 +120,8 @@ def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, 
         bytes_loaded_total = sum(cache_stats["bytes_loaded"].values())
         tokens_total = len(out_ids)
         bytes_per_token = bytes_loaded_total / tokens_total if tokens_total else 0.0
+        lookahead_issued = engine.lookahead_issued
+        lookahead_skipped_core_missing = engine.lookahead_skipped_core_missing
     finally:
         engine.close()
 
@@ -145,6 +148,9 @@ def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, 
         "has_experts": has_experts,
         "expert_hit_pct": expert_hit_pct,
     }
+    if lookahead:
+        result["lookahead_issued"] = lookahead_issued
+        result["lookahead_skipped_core_missing"] = lookahead_skipped_core_missing
     if spec_stats is not None:
         result["spec_stats"] = {
             "target_passes": spec_stats.target_passes,
@@ -181,6 +187,7 @@ def run_bench(
     out: Path | None = None,
     ngram: bool = False,
     ngram_adaptive: bool = True,
+    lookahead: bool = False,
 ) -> list[dict]:
     """Run the bench suite over an already-packed model dir.
 
@@ -224,17 +231,21 @@ def run_bench(
         print("  greedy ...")
         r = _run_one(packed, manifest, ids, eos, label, "greedy",
                      budget_bytes=budget_bytes, max_tokens=max_tokens,
-                     draft_tokens=draft_tokens)
+                     draft_tokens=draft_tokens, lookahead=lookahead)
         results.append(r)
         print(f"    {r['tok_s_decode']:.2f} tok/s, peak {r['peak_memory_gb']:.2f} GB, "
               f"{r['tokens_generated']} tokens")
+        if lookahead:
+            print(f"    lookahead issued {r['lookahead_issued']}, "
+                  f"skipped (core missing) {r['lookahead_skipped_core_missing']}")
 
         if ngram_drafter is not None:
             adaptive_tag = " adaptive" if ngram_adaptive else ""
             print(f"  ngram-spec (K={draft_tokens}{adaptive_tag}) ...")
             r = _run_one(packed, manifest, ids, eos, label, "ngram-spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
-                         draft_tokens=draft_tokens, drafter=ngram_drafter)
+                         draft_tokens=draft_tokens, drafter=ngram_drafter,
+                         lookahead=lookahead)
             results.append(r)
             k_range = ""
             if ngram_adaptive:
@@ -242,14 +253,21 @@ def run_bench(
                            f"{r['spec_stats']['k_max_seen']}")
             print(f"    {r['tok_s_decode']:.2f} tok/s, M={r['spec_stats']['multiplier']:.2f}, "
                   f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens{k_range}")
+            if lookahead:
+                print(f"    lookahead issued {r['lookahead_issued']}, "
+                      f"skipped (core missing) {r['lookahead_skipped_core_missing']}")
         elif draft_model is not None:
             print(f"  spec (K={draft_tokens}) ...")
             r = _run_one(packed, manifest, ids, eos, label, "spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
-                         draft_tokens=draft_tokens, draft_model=draft_model)
+                         draft_tokens=draft_tokens, draft_model=draft_model,
+                         lookahead=lookahead)
             results.append(r)
             print(f"    {r['tok_s_decode']:.2f} tok/s, M={r['spec_stats']['multiplier']:.2f}, "
                   f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens")
+            if lookahead:
+                print(f"    lookahead issued {r['lookahead_issued']}, "
+                      f"skipped (core missing) {r['lookahead_skipped_core_missing']}")
 
     if out is not None:
         import json
@@ -265,6 +283,7 @@ def run_bench(
                 "draft_tokens": draft_tokens,
                 "max_tokens": max_tokens,
                 "budget_bytes": budget_bytes,
+                "lookahead": lookahead,
             },
             "runs": results,
         }, indent=2))
@@ -344,6 +363,9 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
     ngram_adaptive = None
     k_min_seen = None
     k_max_seen = None
+    lookahead_issued_total = 0
+    lookahead_skipped_total = 0
+    has_lookahead = False
     for r in results:
         m = r.get("spec_stats", {}).get("multiplier")
         m_str = f"{m:.2f}" if m is not None else "—"
@@ -371,6 +393,10 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
                 k_max_seen = k if k_max_seen is None else max(k_max_seen, k)
         if budget_bytes is None:
             budget_bytes = r.get("budget_bytes")
+        if "lookahead_issued" in r:
+            has_lookahead = True
+            lookahead_issued_total += r.get("lookahead_issued", 0)
+            lookahead_skipped_total += r.get("lookahead_skipped_core_missing", 0)
 
     if budget_bytes:
         budget_gb = budget_bytes / 1e9
@@ -389,6 +415,9 @@ def format_report(info: dict, results: list[dict], model: str) -> str:
         settings += ", ngram-adaptive=on"
         if k_min_seen is not None and k_max_seen is not None:
             settings += f", k={k_min_seen}-{k_max_seen}"
+    if has_lookahead:
+        settings += (f", lookahead=on (issued {lookahead_issued_total}, "
+                     f"skipped {lookahead_skipped_total})")
     lines.append("")
     lines.append(settings)
 

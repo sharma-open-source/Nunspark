@@ -307,6 +307,7 @@ Key flags:
 | `--no-ngram-adaptive` | Disable the n-gram drafter's adaptive policy. By default it watches its own acceptance rate, shrinks its proposals when they stop earning, and switches itself off entirely (re-probing cheaply every ~50 steps) when speculation isn't paying — so on workloads where prompt-lookup can't win (most MoE decoding) it costs ≈nothing instead of 2–3× throughput. Pass this flag to pin the fixed `--num-draft-tokens` behavior for benchmarking. |
 | `--num-draft-tokens` | Draft tokens proposed per speculative sweep (default 16 — the "deep-K" lever described above). |
 | `--accept-top-k` | `1` = lossless speculative decoding; `>1` = fast mode (bounded deviation from the target distribution). |
+| `--lookahead` | Experimental cross-layer MoE expert prefetch: on decode passes, replicates the next layer's router on the current residual stream and speculatively stages its predicted experts. Output-identical; prefetch only. Silently no-ops on architectures/cores it can't replicate. Opt-in, off by default. |
 | `--metrics` | Print tok/s, peak memory, cache hit/miss, and (if speculative) acceptance-multiplier stats after generation. |
 
 ### The headline use case: a 30B MoE model on a 16 GB Mac
@@ -479,6 +480,23 @@ tests/                                                       # pytest suite, mir
   section). `nunspark serve` still processes one request at a time: true continuous batching
   (requests joining a running batch) is not implemented. Sliding-window models (gpt-oss)
   are excluded from batched decode and fall back to sequential runs.
+
+## Acknowledgements
+
+Two independent MoE-streaming runtimes shaped parts of NunSpark; ideas adopted from
+them were validated against our own gates before shipping (see `docs/backlog.md`
+entries #7 and #13 for the full adoption reviews):
+
+- **[TensorFold](https://github.com/ashhart/TensorFold)** (MIT) — an MoE-streaming
+  runtime on MLX. Inspired our garbage-drafter invariant test, the n-gram drafter's
+  adaptive proposal shrink, and batched decode with shared per-layer expert unions
+  (Plan 5). Their negative result on previous-token expert prefetch independently
+  confirmed our own Phase-1 measurement.
+- **[Colibrì](https://github.com/JustVugg/colibri)** (Apache 2.0) — a pure-C GLM-5.2
+  streaming engine. Their router-predictability measurement corroborated our
+  cross-layer lookahead probe (`--lookahead`, Plan 7), and their MTP-drafter
+  precision finding is recorded for our future GLM-5.2 drafter work. Their expert
+  atlas methodology also informed our expert hot-set analysis.
 
 ## License
 

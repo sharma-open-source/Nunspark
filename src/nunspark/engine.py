@@ -199,6 +199,9 @@ class StreamingEngine:
         expert_cache_frac: float = 0.9,
         expert_prefetch: bool = True,
         decode_bulk_warm: bool = False,
+        lookahead_prefetch: bool = False,
+        lookahead_depth: int = 1,
+        lookahead_topn: int = 12,
     ):
         self.manifest = manifest
         spec = get_architecture(manifest.model_type)
@@ -269,6 +272,23 @@ class StreamingEngine:
         # Phase-1 measured predictive warming net-negative for decode; this flag
         # exists to A/B the exact-miss (non-predictive) variant.
         self._decode_bulk_warm = bool(decode_bulk_warm)
+        # Online router-lookahead expert prefetch (plan7 M1). Opt-in until the M3
+        # gate passes. On single-token decode passes, after a MoE layer L's output
+        # hidden state exists, we replicate layer L+k's router forward (norm + gate
+        # matmul, read-only) on that hidden state to predict its top-N experts and
+        # issue them as speculative prefetches — the only cross-layer queue depth
+        # available at decode. Prediction is pure read-only math on the residual
+        # stream, so the token stream is byte-identical to the flag being off;
+        # correctness never depends on the guess. _lookahead_supported is a cached
+        # per-run verdict (None until the first prediction sees a resident core):
+        # archs whose router cannot be replicated from the core dict (deepseek/glm
+        # MoEGate correction bias) are detected once and skipped silently thereafter.
+        self._lookahead_prefetch = bool(lookahead_prefetch)
+        self._lookahead_depth = max(1, int(lookahead_depth))
+        self._lookahead_topn = max(1, int(lookahead_topn))
+        self._lookahead_supported: bool | None = None
+        self.lookahead_issued = 0
+        self.lookahead_skipped_core_missing = 0
         # Persistent full-size expert scatter buffers (see _scatter_experts);
         # built lazily on first scatter, invalidated by _make_slot.
         self._scatter_bufs: dict | None = None
@@ -682,7 +702,89 @@ class StreamingEngine:
             mix = mix.astype(y.dtype)
         if self._shared_experts_attr is not None:
             mix = mix + getattr(slot.mlp, self._shared_experts_attr)(x)
-        return h + mix
+        out = h + mix
+        # plan7 M1: single-token decode only. batch_tokens==1 is the decode gate
+        # (constraint 5); multi-token / verify passes keep the shipped temporal
+        # prefetch path unchanged. The temporal _spec_fired issue in
+        # _moe_layer_forward is already gated off for single-token passes, so
+        # lookahead does not double-issue on decode.
+        if self._lookahead_prefetch and batch_tokens == 1:
+            self._issue_lookahead(layer, out)
+        return out
+
+    def _router_replicable(self, core: dict) -> bool:
+        """Whether this arch's router can be replicated from the core piece dict
+        as a plain norm+gate-matmul top-k (call once, verdict cached). deepseek/
+        glm MoEGate carries an e_score_correction_bias and does sigmoid + group
+        selection — not a logits->top-k router — so it is skipped; a core without
+        the router weight (unexpected layout) is skipped too."""
+        r = self._router_attr
+        if f"mlp.{r}.weight" not in core:
+            return False
+        if f"mlp.{r}.e_score_correction_bias" in core:
+            return False
+        return True
+
+    def _predict_experts(self, target_layer: int, h: mx.array, core: dict) -> list[int]:
+        """Read-only prediction of `target_layer`'s top-N experts, evaluated on an
+        earlier layer's output hidden state `h` (constraint 1: never touches the
+        real routing/compute path). Replicates the router forward from the resident
+        core piece — rms_norm(post_attention_layernorm) + (quantized) gate matmul
+        (+ the router's linear bias for gpt_oss). Plain top-N by logit ordering is
+        used rather than spec.moe_route's exact top-k: for qwen3_moe (softmax is
+        monotonic) and gpt_oss (top-k on the biased logits) that ordering is the
+        same set the true selection would pick, and prediction quality only affects
+        prefetch usefulness, never output. One host sync (the tolist) per call."""
+        r = self._router_attr
+        x = mx.fast.rms_norm(h, core["post_attention_layernorm.weight"],
+                             self.args.rms_norm_eps)
+        wkey = f"mlp.{r}.weight"
+        if f"mlp.{r}.scales" in core:
+            cfg = self._module_quant(f"model.layers.{target_layer}.mlp.{r}")
+            logits = mx.quantized_matmul(
+                x, core[wkey], scales=core[f"mlp.{r}.scales"],
+                biases=core.get(f"mlp.{r}.biases"), transpose=True,
+                group_size=cfg["group_size"], bits=cfg["bits"],
+                mode=cfg.get("mode", "affine"),
+            )
+        else:
+            logits = x @ core[wkey].T
+        bkey = f"mlp.{r}.bias"          # router's own linear bias (gpt_oss), != quant biases
+        if bkey in core:
+            logits = logits + core[bkey]
+        logits = logits.reshape(-1).astype(mx.float32)
+        n = min(self._lookahead_topn, logits.shape[0])
+        top = mx.argpartition(-logits, kth=n - 1)[:n]
+        return [int(i) for i in top.tolist()]
+
+    def _issue_lookahead(self, layer: int, h: mx.array) -> None:
+        """Predict + speculatively prefetch the experts of layers L+1..L+depth from
+        layer L's output `h`. Never blocks the compute path: the target's core is
+        obtained via a non-blocking cache.peek — a missing core skips that layer
+        (counted) rather than triggering a load. Predicted pieces ride the existing
+        M3a speculative staging tier (constraint 4)."""
+        if self._lookahead_supported is False:
+            return
+        n = self.manifest.num_layers
+        for k in range(1, self._lookahead_depth + 1):
+            tgt = layer + k
+            if tgt >= n:
+                break
+            if not self.manifest.has_piece(Manifest.layer_core_piece_id(tgt)):
+                continue   # dense target layer: no router / experts to prefetch
+            core = self.cache.peek(Manifest.layer_core_piece_id(tgt))
+            if core is None:
+                self.lookahead_skipped_core_missing += 1
+                continue
+            if self._lookahead_supported is None:
+                self._lookahead_supported = self._router_replicable(core)
+                if not self._lookahead_supported:
+                    return   # graceful no-op for the whole run (constraint 6)
+            experts = self._predict_experts(tgt, h, core)
+            pids = [Manifest.layer_expert_piece_id(tgt, e) for e in experts]
+            if pids:
+                self.cache.prefetch(pids, speculative=True)
+                self.lookahead_issued += 1
 
     def _maybe_reset_prefetch(self, kv) -> None:
         """Drop the remembered fired-expert history at a new generation's start.

@@ -206,6 +206,23 @@ class PieceCache:
                 self._staging_bytes -= n
                 self.speculative_wasted_bytes += n  # never demanded within its window
 
+    def peek(self, pid: str) -> dict | None:
+        """Non-blocking resident lookup (plan7 M1 router-lookahead): return the
+        piece's weights if it is ALREADY resident in its region (or the speculative
+        staging buffer), else None. Deliberately inert — it never counts a hit or
+        miss, never reorders LRU/MRU (no move_to_end), never touches inflight /
+        staging accounting, never triggers a load, and never waits on an event. A
+        brief lock read only, so the lookahead prediction can consult residency
+        without perturbing the demand cache's state or blocking the compute path."""
+        with self._lock:
+            tbl = self._region(pid)
+            if pid in tbl:
+                return tbl[pid]
+            staged = self._staging.get(pid)
+            if staged is not None:
+                return staged[0]
+            return None
+
     def get(self, pid: str) -> dict:
         with self._lock:
             tbl = self._region(pid)

@@ -170,6 +170,33 @@ lookahead, much stronger prior than the shipped previous-token temporal prefetch
 (Jaccard ~0.30). Cheap offline go/no-go: instrument one forward pass, measure how often
 true top-8 at L+k lands in the L-state-predicted top-12 (k=1..3).
 
+**Go/no-go MEASURED — strong GO** (scripts/router_lookahead_probe.py,
+scripts/results/router_lookahead_probe.json; Qwen3-30B, 63 decode passes, ~2.9k
+layer-pairs per k): k=1 top-12 mean recall **98.3%** (90.4% of passes fully
+contain the true top-8; top-16 → 99.2%/95.9%); k=2 top-12 still 96.0%; recall
+*improves* with depth (early/mid/late thirds 96.0/99.3/99.7%). Independently
+corroborated by Colibrì's GLM-5.2 measurement (71.6% one layer ahead on the
+256-expert geometry — see #13). Next step is the online half: run layer L+1's
+(core-resident, tiny) router on L's output inside the decode loop, feed the
+predicted top-N into the M3a staging tier, and A/B decode tok/s at fixed budget
+— the win mechanism is converting decode's serial demand-faults (~0.45 GB/s)
+into known-in-advance bulk reads (0.73–1.36 GB/s measured in warm_bulk).
+
+**Plan 7 status (CLOSED 2026-07-20).** M1 (engine seam:
+`StreamingEngine(lookahead_prefetch=...)`, counters, bit-identity +
+non-blocking + prediction-correctness tests) and M2 (CLI/bench/serve
+`--lookahead` plumbing, metrics lines, README flag row) shipped. M3 A/B gate
+**FAILED as configured** (scripts/results/lookahead_ab.json; Qwen3-30B, 6 GB,
+3 flushed interleaved pairs per config): topn=12 median +3.9% with 2/3 pairs
+slower (2.6× read amplification, 42% speculative-load use); topn=8 median
+2.561 → 2.777 (+8.4% < the 10% gate), 1/3 pairs −8%, 76% use, 1.28×
+amplification. Token streams byte-identical in all 6 pairs. Expert stall
+reliably fell 25–30% in every lookahead run — the prediction works; the
+residual waste plus 6 GB control variance (2.40–3.02 tok/s) eats the win.
+`--lookahead` stays opt-in/off. Refinement candidates recorded in
+docs/plan7-lookahead.md ("M3 outcome"); user live sweeps with `--lookahead`
+outrank these probe numbers as ground truth.
+
 ## 10. Decode is NOT disk-bound: fix _scatter_experts full-buffer rebuild + budget cliff (FIX SHIPPED 2026-07-17 — budget sweep still open)
 
 **Outcome.** Persistent full-size scatter buffers (no re-zero; invalidated on
@@ -254,6 +281,10 @@ see docs/plan6-glm52.md for gates. Deliberately deferred:
   nextn layer (dropped at pack time by mlx-lm sanitize). Same shape as the
   gemma4_assistant story; the eagle_drafter/tree_spec seams exist but tree
   spec is gated off for Paired archs (above), so this needs that first.
+  Pre-paid measurement from Colibrì (github.com/JustVugg/colibri, which runs
+  GLM-5.2 MTP spec in production): 2.2–2.8 tokens/forward when it pays, and
+  **the MTP head must stay int8 — int4 heads collapse to 0–4% acceptance**.
+  When we pack the nextn layer, keep it at 8-bit regardless of the base quant.
 - **Real-model numbers.** No perf claims exist anywhere for these archs and
   none may be added until measured (community bench or a high-RAM Mac run).
   Active set is ~39B params/token: expect usable speeds only where most of
@@ -263,3 +294,105 @@ see docs/plan6-glm52.md for gates. Deliberately deferred:
   IndexShare scheduling fields. NunSpark matches mlx-lm bit-for-bit (that is
   our losslessness contract), so any fidelity question past 2048-token
   contexts is upstream's to resolve; re-check when mlx-lm updates.
+
+## 13. Colibrì adoptions (assessed 2026-07-20 — github.com/JustVugg/colibri, Apache 2.0)
+
+Colibrì is a pure-C GLM-5.2 streaming engine (744B on ~25 GB RAM, token-exact
+vs a transformers oracle) — the closest independent comparable to NunSpark.
+TensorFold-style adoption review (cf. #7):
+
+- **(C1) Router-lookahead prefetch — validates our #9, PROMOTE.** Their PILOT
+  thread prefetches the next layer's experts from routing that is "measurably
+  71.6% predictable one layer ahead" on GLM-5.2's 256-expert geometry. Our own
+  offline probe (see #9 update) measures 98.3% top-12 recall at k=1 on
+  Qwen3-30B. Two independent codebases, two models, same conclusion: the
+  residual stream changes slowly enough to prefetch one layer ahead. #9's
+  online A/B ran as Plan 7 — shipped lossless + opt-in, but the perf gate
+  FAILED (see #9 Plan 7 status): prediction is accurate and stall drops, yet
+  read amplification + bench variance eat the win on the 16 GB testbed.
+- **(C2) Persistent learned expert pinning — offline go/no-go MEASURED
+  2026-07-20: cross-workload transfer is dead; same-workload only.** They
+  record per-workload expert usage (`.coli_usage`) and pin the hottest experts
+  across sessions; lossless (cache policy only), and we already have the
+  unused `pinned` seam in PieceCache. Offline probe over the existing M1
+  Qwen3-30B decode traces (scripts/expert_hotset_offline_probe.py,
+  scripts/results/expert_hotset_offline.json; 192k expert-loads per workload,
+  5646 (layer,expert) pairs): within one workload the distribution IS
+  concentrated (top-1% of pairs = ~10% of loads, top-10% = ~46-52%, i.e.
+  5-10x uniform) — but a hot set ranked on one workload barely beats uniform
+  on another (top-1% pins → 0.0-1.3% coverage vs 1% uniform; top-10% →
+  13-19% vs 10%). The hottest experts are workload-specific, which matches
+  their own atlas finding (experts are topic-specialized). So: do NOT build
+  generic cross-session pinning. The surviving narrow case is same-workload
+  cold-start warming (resume yesterday's coding session → prefetch its top
+  pins during model load, before the first token) — park it unless a
+  cold-start TTFB complaint shows up; in-session, LRU already harvests the
+  same concentration. Caveat: one prompt per workload in these traces
+  (their atlas doc's autocorrelation trap), so "same workload tomorrow"
+  likely transfers better than the cross-workload floor measured here.
+- **(C3) MTP int8 constraint** — recorded under #11 (drafter head must be
+  int8; int4 collapses acceptance to 0–4%).
+- **REJECTED: cache-aware routing (`CACHE_ROUTE`).** They optionally swap
+  cached experts into the executed set within a rank window (top-J guaranteed,
+  window M preferred-if-cached). This changes which experts run — lossy output
+  by construction, violating our bit-identity contract. Even Colibrì ships it
+  off-by-default and labels it experimental. Do not re-propose; recorded here
+  so the idea has a grave.
+- Already have: batch-union expert reads (Plan 5 batched decode), MLA
+  compressed KV (deepseek_v32/glm_moe_dsa land it for free).
+- Their expert-atlas methodology doc (c/tools/expert_atlas/README.md) lists
+  measurement traps worth honoring in the C2 probe: top-p sampling hides ~38%
+  of distinct active experts (probe at temp 0), speculative drafts inflate
+  usage counts (probe with spec off), cumulative usage logs capture prior runs
+  (clear between arms), and per-prompt autocorrelation (validate across
+  prompts, not within one).
+
+## 12. DeepSeek-V4-Flash (`deepseek_v4`) — BLOCKED on upstream mlx-lm (assessed 2026-07-20)
+
+**Verdict: cannot ship yet without violating the losslessness contract.**
+DeepSeek-V4-Flash (284B total / 13B active, `model_type: "deepseek_v4"`) has
+NO implementation in any released mlx-lm (0.31.3 is latest, checked PyPI
+2026-07-20). Support lives only in open PR ml-explore/mlx-lm#1189
+(32+ commits, still churning), whose own thread documents cache divergence
+between single-token and batched decode, Metal-kernel numerical instability,
+and a RoPE frequency bug. Our product invariant is "bit-identical to
+full-load mlx-lm"; with no stable reference, bit-identity is unverifiable —
+and vendoring the PR (gemma4_assistant-style) would enshrine its bugs as our
+reference. Community MLX conversions exist on HF but fail to LOAD upstream
+(`KeyError: 'deepseek_v4'`) — they were converted, not validated.
+
+**Unblock trigger:** PR #1189 merges and ships in an mlx-lm release → bump
+the pin, then run the Plan-6 playbook (tiny seeded model, gated milestones).
+
+**Contract-fit analysis (done now so the plan can start cold).** Config
+(deepseek-ai/DeepSeek-V4-Flash): 43 layers, hidden 4096, 256 routed + 1
+shared expert top-6, first 3 MoE layers hash-routed (`num_hash_layers`,
+static tid2eid table), hybrid CSA/HCA attention with per-layer
+`compress_ratios` alternating [0, 4, 128], indexer (`index_topk` 512,
+sliding_window 128), yarn rope + separate `compress_rope_theta`, mHC
+hyper-connections (`hc_mult` 4, Sinkhorn-normalized comb), 1 MTP layer,
+fp8 block weights with fp4 experts. Streaming-contract breaks, hardest first:
+
+1. **mHC hyper-connections replace residuals.** The engine's outer loop
+   assumes ONE [B,L,D] stream with residual-inside-block; mHC threads
+   hc_mult=4 hidden copies across layers with learned pre/post/comb mixing.
+   Needs: expand-at-embed, collapse-before-final-norm, and a LayerRunner +
+   LayerContext carrying the 4-copy state (gemma4 seam precedent — bigger,
+   but the seam exists). This is the single largest engine assumption ever
+   touched; budget it accordingly.
+2. **Heterogeneous compressed caches.** Per-layer compress_ratios ⇒ mixed
+   cache classes (whatever the PR ships: sliding + compressed-KV + indexer),
+   NOT plain KVCache. Extends the Paired/cache_plan seam from Plan 6; spill,
+   clone/recording, and offset probes all need the new kinds or clean
+   refusals.
+3. **Hash-routed early MoE.** Deterministic tid2eid routing for layers 0-2:
+   selective streaming actually gets EASIER (fired set known from token ids,
+   perfect prefetch), but the router seam must bypass gate logits entirely —
+   a new `moe_route`-adjacent hook that consumes token ids, not activations.
+4. **Packer:** fp8-block + fp4-expert checkpoints (mlx conversion handles
+   dequant upstream, as deepseek_v32 sanitize does); MTP layer drop; expert
+   split follows the existing switch-mlp path if the PR uses SwitchGLU.
+
+**Do NOT** pre-implement against the PR branch "to be ready" — the PR's own
+instability means any pre-built parity target is sand. Re-check this entry
+when bumping mlx-lm for any other reason.

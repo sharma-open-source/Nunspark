@@ -107,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "loads with attention/router compute by speculatively "
                             "prefetching the previous pass's per-layer expert sets "
                             "(default on; --no-expert-prefetch to disable)")
+    p_gen.add_argument("--lookahead", action="store_true",
+                       help="experimental cross-layer MoE expert prefetch (plan7): on "
+                            "decode passes, replicate the next layer's router on the "
+                            "current residual stream and speculatively stage its "
+                            "predicted experts. Output-identical to off; prefetch only. "
+                            "Opt-in, off by default")
 
     p_serve = sub.add_parser("serve", help="serve a packed model behind an OpenAI v1-compatible API")
     p_serve.add_argument("packed_dir")
@@ -140,6 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--no-prefix-cache", dest="use_prefix_cache",
                          action="store_false",
                          help="disable single-slot prompt-prefix KV reuse (default: on)")
+    p_serve.add_argument("--lookahead", action="store_true",
+                         help="experimental cross-layer MoE expert prefetch (plan7): on "
+                              "decode passes, replicate the next layer's router on the "
+                              "current residual stream and speculatively stage its "
+                              "predicted experts. Output-identical to off; prefetch only. "
+                              "Opt-in, off by default")
 
     p_web = sub.add_parser("web", help="launch the local web interface")
     p_web.add_argument("--packed-root", default="models",
@@ -177,6 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
                          help="fast smoke run: single prose workload, greedy only, 50 tokens")
     p_bench.add_argument("--yes", action="store_true",
                          help="skip the confirmation prompt before packing an HF repo")
+    p_bench.add_argument("--lookahead", action="store_true",
+                         help="experimental cross-layer MoE expert prefetch (plan7): on "
+                              "decode passes, replicate the next layer's router on the "
+                              "current residual stream and speculatively stage its "
+                              "predicted experts. Output-identical to off; prefetch only. "
+                              "Opt-in, off by default")
 
     return parser
 
@@ -206,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             expert_trace=args.expert_trace,
             expert_cache_frac=args.expert_cache_frac,
             expert_prefetch=args.expert_prefetch,
+            lookahead_prefetch=args.lookahead,
         )
         try:
             from .generate import check_kv_quant_support
@@ -486,6 +505,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             cache_peak = engine.cache.peak_bytes
             cache_hits, cache_misses = engine.cache.hits, engine.cache.misses
+            lookahead_issued = engine.lookahead_issued
+            lookahead_skipped_core_missing = engine.lookahead_skipped_core_missing
             engine.close()
 
         if args.metrics:
@@ -504,6 +525,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"kv-budget             : {args.kv_budget}  ({_parse_size(args.kv_budget)/1e9:.2f} GB)")
             print(f"kv resident peak      : {kv_peak/1e9:.2f} GB")
             print(f"kv hits / misses      : {kv_hits} / {kv_misses}")
+            if args.lookahead:
+                print(f"lookahead issued      : {lookahead_issued}")
+                print(f"lookahead skip (core) : {lookahead_skipped_core_missing}")
             if spec_stats is not None:
                 print(f"draft model           : {args.draft_model}")
                 print(f"draft tokens / sweep  : {args.num_draft_tokens}")
@@ -534,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
                 accept_top_k=args.accept_top_k,
                 kv_quant=_kv_quant_from_args(args),
                 use_prefix_cache=args.use_prefix_cache,
+                lookahead_prefetch=args.lookahead,
             )
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -585,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
             budget=_resolve_budget(args.budget), max_tokens=max_tokens,
             workloads=workloads, out=out_path, ngram=ngram,
             ngram_adaptive=args.ngram_adaptive,
+            lookahead=args.lookahead,
         )
 
         info = system_info()
