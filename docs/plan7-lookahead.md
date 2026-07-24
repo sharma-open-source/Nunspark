@@ -1,8 +1,11 @@
 # Plan 7 — Online router-lookahead expert prefetch (backlog #9 / #13-C1)
 
-Status: COMPLETE 2026-07-20. M1 + M2 shipped (flag opt-in); M3 gate ran and
-**FAILED as configured** — `--lookahead` stays opt-in/off. See "M3 outcome"
-at the end of this doc and scripts/results/lookahead_ab.json.
+Status: CLOSED 2026-07-24. M1 + M2 shipped (flag opt-in); M3 gate ran and
+**FAILED as configured** (2026-07-20, 6 GB unwired), then **FAILED AGAIN,
+final, on the wired baseline** (2026-07-24, 10 GB wired — the re-run backlog
+#14-5 called for). `--lookahead` stays opt-in/off; do not re-gate on this
+hardware class. See "M3 outcome" and "M3 wired re-run" at the end of this
+doc, scripts/results/lookahead_ab.json and lookahead_wired_ab.json.
 
 ## Motivation (all measured)
 
@@ -148,3 +151,39 @@ per-run expert-stall fraction — the feature can only win its stall share
 models, colder caches) should see more than this 16 GB testbed can.
 User live sweeps with `--lookahead` on other budgets/models remain the
 ground truth over these probe numbers.
+
+## M3 wired re-run (measured 2026-07-24 — gate FAIL, FINAL; question closed)
+
+Backlog #14-5 asked whether the gate flips on the wired baseline: the
+2026-07-20 fail was attributed partly to control variance (2.40–3.02 tok/s
+unwired) that wiring removes, and partly to read amplification that the new
+10 GB optimum (miss volume 41.6 → 5.9/token, ~7×) should shrink. Re-run:
+scripts/lookahead_wired_rerun.py driving the UNCHANGED original child
+(engine wired via the shipped default), 10 GB budget, 200 greedy tokens,
+3 ABBA flushed pairs per topn, scripts/results/lookahead_wired_ab.json.
+Token streams byte-identical in all 12 runs; deterministic counters
+identical across same-arm runs.
+
+- **top8: +1.5% median (7.982 → 8.103) — FAIL.** Clean pairs +1.8/+1.5%
+  (the +48.8% first pair is the first-run-of-session compressor artifact in
+  the control, see backlog #15). Waste clause also fails: 1.79 GiB wasted
+  ≈ 44% of ~4.05 GiB speculative bytes issued (used 899/1635); read
+  amplification 14.8 → 24.3 MB/token (1.64×).
+- **top12: −5.9% median (7.999 → 7.529) — FAIL, actively harmful.** Clean
+  pairs −2.8/−4.6%; 9.33 GiB wasted ≈ 77% of speculative bytes (used
+  1107/4908); 64.2 MB/token = 4.3× amplification, enough to induce memory
+  pressure (29 GB compressed in its worst run).
+- **The variance theory is resolved: there was no gate-sized win to mask.**
+  The mechanism still works — expert stall 3.62 → 2.68 s median (−26%),
+  same relative stall kill as the original run — but at the wired optimum
+  expert stall is only ~14% of decode (3.6 s of 25 s), so refinement
+  candidate (d) above now reads as the verdict: the feature can only win
+  its stall share, and this baseline doesn't have one worth winning.
+  Perfect prefetching (zero stall, zero amplification) would bound at
+  ~+16%; the realistic ceiling after paying amplification is low single
+  digits, below the 10% gate by construction.
+
+Do not re-gate lookahead on this hardware class. The surviving venue is a
+machine/model whose steady-state expert-stall fraction is large (bigger
+models, tighter relative budgets) — check the stall share FIRST (bench
+`--metrics` reports it) before spending another gate on this.
