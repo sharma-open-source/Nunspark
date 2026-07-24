@@ -73,13 +73,14 @@ def _encode(tokenizer, prompt: str) -> list[int]:
 
 def _run_one(packed: Path, manifest: Manifest, ids: list[int], eos, label: str, mode: str,
             *, budget_bytes: int, max_tokens: int, draft_tokens: int,
-            draft_model=None, drafter=None, lookahead: bool = False) -> dict:
+            draft_model=None, drafter=None, lookahead: bool = False,
+            wire_limit: bool = True) -> dict:
     """Build a FRESH engine for this run (independent cache stats / peak memory),
     stream up to max_tokens greedy or speculative tokens via the existing
     generate() entry points, and return a metrics dict. Mirrors
     scripts/m1_baseline.py:_run_one."""
     engine = StreamingEngine(packed, manifest, budget_bytes=budget_bytes,
-                             lookahead_prefetch=lookahead)
+                             lookahead_prefetch=lookahead, wire_limit=wire_limit)
     try:
         mx.reset_peak_memory()
         spec_stats = SpecStats() if mode in ("spec", "ngram-spec") else None
@@ -188,6 +189,7 @@ def run_bench(
     ngram: bool = False,
     ngram_adaptive: bool = True,
     lookahead: bool = False,
+    wire_limit: bool = True,
 ) -> list[dict]:
     """Run the bench suite over an already-packed model dir.
 
@@ -231,7 +233,8 @@ def run_bench(
         print("  greedy ...")
         r = _run_one(packed, manifest, ids, eos, label, "greedy",
                      budget_bytes=budget_bytes, max_tokens=max_tokens,
-                     draft_tokens=draft_tokens, lookahead=lookahead)
+                     draft_tokens=draft_tokens, lookahead=lookahead,
+                     wire_limit=wire_limit)
         results.append(r)
         print(f"    {r['tok_s_decode']:.2f} tok/s, peak {r['peak_memory_gb']:.2f} GB, "
               f"{r['tokens_generated']} tokens")
@@ -245,7 +248,7 @@ def run_bench(
             r = _run_one(packed, manifest, ids, eos, label, "ngram-spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
                          draft_tokens=draft_tokens, drafter=ngram_drafter,
-                         lookahead=lookahead)
+                         lookahead=lookahead, wire_limit=wire_limit)
             results.append(r)
             k_range = ""
             if ngram_adaptive:
@@ -261,7 +264,7 @@ def run_bench(
             r = _run_one(packed, manifest, ids, eos, label, "spec",
                          budget_bytes=budget_bytes, max_tokens=max_tokens,
                          draft_tokens=draft_tokens, draft_model=draft_model,
-                         lookahead=lookahead)
+                         lookahead=lookahead, wire_limit=wire_limit)
             results.append(r)
             print(f"    {r['tok_s_decode']:.2f} tok/s, M={r['spec_stats']['multiplier']:.2f}, "
                   f"peak {r['peak_memory_gb']:.2f} GB, {r['tokens_generated']} tokens")

@@ -113,6 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "current residual stream and speculatively stage its "
                             "predicted experts. Output-identical to off; prefetch only. "
                             "Opt-in, off by default")
+    p_gen.add_argument("--no-wire", dest="wire", action="store_false",
+                       help="don't raise the MLX wired-memory limit at startup. "
+                            "Default is to wire it to the device's recommended "
+                            "working-set size so macOS can't compress the piece "
+                            "cache out from under the engine (backlog #14); "
+                            "memory policy only, output-identical either way")
 
     p_serve = sub.add_parser("serve", help="serve a packed model behind an OpenAI v1-compatible API")
     p_serve.add_argument("packed_dir")
@@ -146,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--no-prefix-cache", dest="use_prefix_cache",
                          action="store_false",
                          help="disable single-slot prompt-prefix KV reuse (default: on)")
+    p_serve.add_argument("--no-wire", dest="wire", action="store_false",
+                         help="don't raise the MLX wired-memory limit at startup "
+                              "(default: wire to the device's recommended working-set "
+                              "size; see nunspark generate --help)")
     p_serve.add_argument("--lookahead", action="store_true",
                          help="experimental cross-layer MoE expert prefetch (plan7): on "
                               "decode passes, replicate the next layer's router on the "
@@ -195,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "current residual stream and speculatively stage its "
                               "predicted experts. Output-identical to off; prefetch only. "
                               "Opt-in, off by default")
+    p_bench.add_argument("--no-wire", dest="wire", action="store_false",
+                         help="don't raise the MLX wired-memory limit for the bench "
+                              "runs (default: wired; used to A/B the unwired legacy "
+                              "behavior — see nunspark generate --help)")
 
     return parser
 
@@ -225,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             expert_cache_frac=args.expert_cache_frac,
             expert_prefetch=args.expert_prefetch,
             lookahead_prefetch=args.lookahead,
+            wire_limit=args.wire,
         )
         try:
             from .generate import check_kv_quant_support
@@ -559,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
                 kv_quant=_kv_quant_from_args(args),
                 use_prefix_cache=args.use_prefix_cache,
                 lookahead_prefetch=args.lookahead,
+                wire_limit=args.wire,
             )
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -611,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
             workloads=workloads, out=out_path, ngram=ngram,
             ngram_adaptive=args.ngram_adaptive,
             lookahead=args.lookahead,
+            wire_limit=args.wire,
         )
 
         info = system_info()

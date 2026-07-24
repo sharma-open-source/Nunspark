@@ -614,6 +614,7 @@ def build_server(
     kv_quant: KVQuant | None = None,
     use_prefix_cache: bool = True,
     lookahead_prefetch: bool = False,
+    wire_limit: bool = True,
 ) -> tuple[HTTPServer, ServerState]:
     """Load the manifest, engine, and tokenizer, and bind an HTTP server.
 
@@ -629,7 +630,7 @@ def build_server(
     engine = StreamingEngine(
         packed_dir, manifest, budget_bytes=budget_bytes, prefetch=prefetch,
         io_threads=io_threads, warm_window=warm_window,
-        lookahead_prefetch=lookahead_prefetch,
+        lookahead_prefetch=lookahead_prefetch, wire_limit=wire_limit,
     )
 
     from .generate import check_kv_quant_support

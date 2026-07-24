@@ -15,9 +15,9 @@ on disk and streams exactly the weights each token needs through a small residen
 then claws the speed back with three levers that only make sense in the disk-bound regime:
 
 - **MoE expert streaming** — a Qwen3-30B-A3B token fires only 8 of 128 experts per layer.
-  NunSpark loads *only those*, caches them expert-aware, and prefetches the ones the next
-  verify pass will probably fire. Measured on a 16 GB M4: **0.5 → 3.2 tok/s**, reading
-  ~100 MB/token instead of ~1 GB.
+  NunSpark loads *only those*, caches them expert-aware (in a wired buffer pool the macOS
+  compressor can't steal), and prefetches the ones the next verify pass will probably fire.
+  Measured on a 16 GB M4: **0.5 → 7–8 tok/s**, reading ~18 MB/token instead of ~1 GB.
 - **Deep-K speculative decoding** — on disk-bound hardware the draft model's compute is free,
   so speculation can go far deeper (K=16–24) than GPU serving ever would. One weight sweep
   buys up to 7 accepted tokens. Lossless: every emitted token is the target's own argmax
@@ -31,7 +31,7 @@ then claws the speed back with three levers that only make sense in the disk-bou
 
 | Model (4-bit) | Size on disk | tok/s | How |
 |---|---|---|---|
-| Qwen3-30B-A3B (MoE) | 16 GB | **2.8–3.2** | expert streaming + expert-aware cache + persistent scatter buffers (0.9.x, auto budget 6 GB) |
+| Qwen3-30B-A3B (MoE) | 16 GB | **6.9 live / 7.8–8.0 probes** | expert streaming + expert-aware cache + persistent scatter buffers + wired buffer pool (auto budget 10 GB; first run from a cold disk pays a one-time cache-fill ramp — see the `--budget` notes) |
 | Qwen3-30B-A3B (MoE) | 16 GB | **up to 1.54 speculative** | + deep-K spec (M≈7 on reasoning prompts; pre-scatter-fix number — re-benchmark pending) |
 | Qwen2.5-32B (dense) | 18 GB | **0.9–1.1** | streaming + deep-K spec |
 | Llama-3.3-70B (dense) | 40 GB | **~0.9** | streaming + deep-K spec |
@@ -44,10 +44,14 @@ hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality 
 
 ### Which model for your RAM
 
-- **16 GB** → `Qwen3-30B-A3B-4bit`, default `--budget auto` (picks 6 GB — the measured
-  optimum, **3.2 tok/s greedy**). **More budget is not faster**: past the memory cliff the
-  cache fights the macOS compressor — a measured 4/5/6/8/10 GB sweep on a 16 GB M4 gave
-  1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s. When in doubt go lower, not higher.
+- **16 GB** → `Qwen3-30B-A3B-4bit`, default `--budget auto` (picks 10 GB — the measured
+  wired optimum: **7.8 tok/s in flushed probes, 6.9 tok/s live over 800 tokens**; wired
+  sweep 6/8/9/10/11 GB = 4.59 / 6.40 / 6.69 / **7.79** / 6.36). The engine wires its
+  buffer pool by default, so budget scales throughput monotonically — up to the device
+  wired limit (~0.75 × RAM): past it the macOS compressor returns (11 GB budget → 11.99 GB
+  peak crosses the 11.84 GB wire and regresses). The **first** generation after boot pays a
+  one-time cache-fill ramp (~2.7 tok/s over a cold 200-token run); later runs warm-start
+  from the OS page cache at full speed.
 - **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit`
   with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` (community: 4.57 tok/s spec vs 3.39
   greedy on code at 64 GB/budget 48GB; 1.16 spec vs 0.10 greedy on a 32 GB M1 Pro at budget
@@ -296,7 +300,7 @@ Key flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`, or `auto`). Default `auto`: **75% of (total RAM − 8 GB)** — 16 GB → 6 GB, 64 GB → 42 GB, 128 GB → 90 GB. The fixed 8 GB reflects the OS-plus-apps baseline, which doesn't scale with RAM. **More budget is not faster**: past the memory cliff the cache fights the macOS compressor, and the cliff is asymmetric (a measured 4/5/6/8/10 GB sweep on a 16 GB M4 with the 30B gave 1.79 / 2.52 / **3.23** / 2.84 / 1.33 tok/s) — when in doubt go lower, not higher. Community numbers below were run with an explicit `--budget`; pin one yourself for comparable results. |
+| `--budget` | Resident weight budget (e.g. `512MB`, `4GB`, or `auto`). Default `auto`: **75% of total RAM − 2 GB** — 16 GB → 10 GB, 64 GB → 46 GB, 128 GB → 94 GB — sized so the peak working set (budget + ~1 GB engine overhead) stays under the device's wired-memory limit (~0.75 × RAM), which the engine raises by default (`--no-wire` to disable). Wired, **more budget IS faster** up to that line (measured 16 GB wired sweep: 6/8/9/10/11 GB = 4.59 / 6.40 / 6.69 / **7.79** / 6.36 tok/s — 11 GB crosses the wire and the compressor returns). The old advice "more budget is not faster" described the unwired engine, whose cache macOS compressed out from under it. Community numbers below were run with an explicit `--budget` (pre-wiring); pin one yourself for comparable results. |
 | `--kv-budget` | Resident KV-cache budget (default: unbounded). |
 | `--kv-bits {4,8}` | Quantize the KV cache (default fp16). |
 | `--io-threads` / `--warm-window` | Parallel page-cache warming (experimental; measured net-neutral or negative in most configurations)). |
@@ -308,6 +312,7 @@ Key flags:
 | `--num-draft-tokens` | Draft tokens proposed per speculative sweep (default 16 — the "deep-K" lever described above). |
 | `--accept-top-k` | `1` = lossless speculative decoding; `>1` = fast mode (bounded deviation from the target distribution). |
 | `--lookahead` | Experimental cross-layer MoE expert prefetch: on decode passes, replicates the next layer's router on the current residual stream and speculatively stages its predicted experts. Output-identical; prefetch only. Silently no-ops on architectures/cores it can't replicate. Opt-in, off by default. |
+| `--no-wire` | Don't raise the MLX wired-memory limit at startup. By default the engine wires the buffer pool to the device's recommended working-set size (as mlx-lm does) so macOS can't compress the piece cache out from under it — memory policy only, output-identical either way. The flag exists for A/Bing the legacy unwired behavior. |
 | `--metrics` | Print tok/s, peak memory, cache hit/miss, and (if speculative) acceptance-multiplier stats after generation. |
 
 ### The headline use case: a 30B MoE model on a 16 GB Mac
@@ -320,8 +325,9 @@ streaming only the experts each token actually fires:
 #    core piece + one piece per expert (~6200 files for Qwen3-30B-A3B).
 uv run nunspark pack mlx-community/Qwen3-30B-A3B-4bit ./packed/qwen3-30b
 
-# 2. Stream it. Greedy decode alone reaches ~3.2 tok/s at the default auto budget
-#    (6 GB on a 16 GB machine, 0.9.x):
+# 2. Stream it. Greedy decode reaches ~7 tok/s live (7.8-8.0 in flushed probes) at the
+#    default auto budget (10 GB on a 16 GB machine, wired buffer pool). The first run
+#    after boot pays a one-time cache-fill ramp; later runs warm-start from the page cache:
 uv run nunspark generate ./packed/qwen3-30b \
   --prompt "Explain how a B-tree stays balanced." \
   --max-tokens 256 --metrics

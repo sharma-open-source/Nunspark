@@ -16,6 +16,7 @@ from .archspec import LayerContext, UniformCausal, _ConstMask, cache_offset
 from .manifest import Manifest
 from .piece_store import PieceStore
 from .piece_cache import PieceCache
+from .sysmem import wire_memory_limit
 
 
 def _quant_base_config(quant: dict | None) -> dict | None:
@@ -202,7 +203,15 @@ class StreamingEngine:
         lookahead_prefetch: bool = False,
         lookahead_depth: int = 1,
         lookahead_topn: int = 12,
+        wire_limit: bool = True,
     ):
+        # Wire the MLX buffer pool BEFORE anything is allocated: unwired, the
+        # macOS compressor steals the piece cache under memory pressure (the
+        # entire "more budget is not faster" cliff — backlog #14, measured
+        # 2026-07-24). Memory policy only; the token stream is byte-identical
+        # either way. `wire_limit=False` (CLI --no-wire) restores the old
+        # behavior for A/Bs; on mlx builds without the API this is a no-op.
+        self.wired_limit_bytes = wire_memory_limit() if wire_limit else None
         self.manifest = manifest
         spec = get_architecture(manifest.model_type)
         self._spec = spec

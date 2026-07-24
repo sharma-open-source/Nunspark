@@ -347,6 +347,89 @@ TensorFold-style adoption review (cf. #7):
   (clear between arms), and per-prompt autocorrelation (validate across
   prompts, not within one).
 
+## 14. Wired-memory limit: the budget cliff is a wiring artifact (MEASURED 2026-07-24 — GATE PASS, ship it)
+
+**Finding.** NunSpark never called `mx.set_wired_limit()`, so the entire piece
+cache lived in pageable anonymous memory — exactly what the macOS compressor
+eats. (mlx-lm's own generate loop sets the wired limit to
+`device_info()["max_recommended_working_set_size"]` before decoding; our
+generate loop didn't.) A/B probe (scripts/wired_limit_probe.py,
+scripts/results/wired_limit_ab.json; M4 16 GB, Qwen3-30B, 150 greedy tokens,
+fresh child process per run, ABBA-interleaved, flushed, vm_stat deltas per
+run, wired limit 11.84 GB = device max_recommended):
+
+- Median tok/s control vs wired: 6 GB 3.26 → 4.59 (+41%); 8 GB 5.30 → 6.40
+  (+21%); 10 GB 2.67 → **7.98 (+199%)**. Wired never lost any pairing; token
+  streams byte-identical in all 12 runs (wiring is memory policy only).
+- **The #10 budget cliff inverts**: wired scaling is monotonic with budget
+  (4.59 / 6.40 / 7.98 at 6/8/10 GB). "More budget is not faster" was true
+  only because the extra budget was being compressed out from under the
+  engine — control RSS at a 10 GB budget was 4.9–5.5 GB (the compressor held
+  ~half the cache) vs 10.6 GB wired. Control runs compressed 37–57 GB of
+  memory per ~30–60 s decode (10 GB control: ~0.5M swapins + ~0.58M
+  swapouts); wired runs 8–13 GB.
+- New 16 GB best: **8.0 tok/s greedy** (2.5× the 3.2 headline), and wired
+  runs are near-deterministic (spread 0.3–0.8% vs control's 2.20–4.32 at
+  6 GB) — which also explains the 40% bench variance recorded in #10 and
+  the variance that ate the Plan-7 lookahead gate (#9); lookahead may
+  deserve a re-run on a wired baseline.
+
+**Follow-ups, in order:**
+1. ~~Wired-mode budget re-sweep at 9/10/11 GB~~ **DONE 2026-07-24**
+   (scripts/results/wired_limit_ab_v2.json): the 16 GB wired optimum is a
+   **10 GB budget** — wired medians 6.69 / 7.79 / 6.36 at 9/10/11 GB; all
+   four wired 10 GB runs across both sweeps sit in 7.785–8.006 tok/s.
+   11 GB regresses and destabilizes for a measured reason: peak working set
+   11.99 GB exceeds the 11.84 GB wired limit, so the tail past the wire is
+   compressed again (33.8 GB compressed, 299k swapouts in the slow run).
+   **Rule: budget + ~1 GB engine overhead must stay under
+   max_recommended_working_set_size** — the wired-regime auto formula should
+   be ≈ `max_recommended − 2 GB` (16 GB: 11.84 − 2 ≈ 10, the measured
+   optimum), not a fraction of total RAM. Also observed: unwired control
+   spans 3× run-to-run (2.05–6.38 at 9 GB — the compressor sometimes stays
+   away entirely), so wiring buys determinism as well as speed.
+2. ~~Live-session verification~~ **DONE 2026-07-24: 6.92 tok/s live over
+   800 tokens at 10 GB** (second run, warm page cache — near-steady-state
+   from token 1), vs 3.23 pre-wiring live best and 1.33 pre-wiring live at
+   the same 10 GB budget. Matches the 7.8–8.0 flushed probes given live
+   conditions. The first-run details below stand as the cold-start
+   characterization.
+   **First live run (2026-07-24, 200 tokens, 17-token prompt): 2.68 tok/s —
+   2.0× the unwired live baseline at the same budget/length (1.33), but
+   ramp-dominated:** 5146 misses ≈ 9 GB ≈ the entire 9.52 GB resident peak,
+   i.e. the whole run was cache fill at single-token demand-fault speed,
+   with the user observing the expected slow-start/fast-finish. Below the
+   old 6 GB live number (3.23) at this length — **the optimum budget is now
+   generation-length-dependent** (fill cost vs steady-state advantage).
+   Longer-run live datapoint pending. This is also C2's parked "cold-start
+   warming" complaint materializing: a startup bulk prewarm (sequential-read
+   the cache full at load time, ~2 GB/s, instead of demand-faulting it over
+   the first ~150 decode tokens at ~0.45 GB/s) would kill the ramp — at a
+   10/16 coverage ratio even a uniform fill gives a ~62% hit floor from
+   token 1, and unlike the dead per-token decode warming (#9/Phase-1) it is
+   a one-shot known-in-advance bulk read, the same mechanism that made
+   prefill warm_bulk (#1) a 2× win.
+3. ~~Ship set_wired_limit~~ **SHIPPED 2026-07-24** (uncommitted):
+   `sysmem.wire_memory_limit()` sets the limit to the device
+   max_recommended_working_set_size; `StreamingEngine(wire_limit=True)`
+   default-on before any allocation (all construction sites inherit);
+   `--no-wire` opt-out on generate/serve/bench; tests/test_wire_limit.py.
+   The probe's child passes `wire_limit=False` explicitly so its control arm
+   stays honest under the new default.
+4. ~~Re-derive the auto-budget formula~~ **DONE 2026-07-24** (uncommitted):
+   sysmem.py auto is now `0.75 × RAM − 2 GiB` (16 → 10, 64 → 46, 128 → 94)
+   — still a pure function of total RAM (availability-clamp lesson honored);
+   the 2 GiB headroom keeps budget + ~1 GB engine overhead under the wired
+   limit (~0.75 × RAM). tests/test_sysmem.py + test_cli.py constants
+   updated (old: 6/42/90); README headline, model guide, `--budget` row,
+   quickstart, and CLAUDE.md rewritten — "more budget is not faster" is
+   retired with attribution to the wiring artifact. 64/128 GB values sit
+   inside community-verified unwired ranges (44–58 / 90 GB ran fine);
+   wired re-verification from community machines welcome.
+5. Re-run candidates on the new wired baseline: the Plan-7 lookahead M3 gate
+   (#9 — it failed partly on control variance that wiring removes) and the
+   spec-vs-greedy break-evens (#5, #10 REMAINING).
+
 ## 12. DeepSeek-V4-Flash (`deepseek_v4`) — BLOCKED on upstream mlx-lm (assessed 2026-07-20)
 
 **Verdict: cannot ship yet without violating the losslessness contract.**
