@@ -223,6 +223,79 @@ def error_response(message, *, error_type="invalid_request_error", code=None) ->
     return {"error": {"message": message, "type": error_type, "code": code}}
 
 
+def anthropic_error_response(message, *, error_type="invalid_request_error") -> dict:
+    return {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+def anthropic_message_response(*, message_id, model, text, stop_reason,
+                               prompt_tokens, completion_tokens) -> dict:
+    return {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+        },
+    }
+
+
+def anthropic_message_start(*, message_id, model, prompt_tokens) -> dict:
+    return {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+        },
+    }
+
+
+def anthropic_content_block_start(*, index: int = 0) -> dict:
+    return {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "text", "text": ""},
+    }
+
+
+def anthropic_content_block_delta(*, index: int, text: str) -> dict:
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    }
+
+
+def anthropic_content_block_stop(*, index: int = 0) -> dict:
+    return {"type": "content_block_stop", "index": index}
+
+
+def anthropic_message_delta(*, stop_reason: str, completion_tokens: int) -> dict:
+    return {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": completion_tokens},
+    }
+
+
+def anthropic_message_stop() -> dict:
+    return {"type": "message_stop"}
+
+
+def anthropic_ping() -> dict:
+    return {"type": "ping"}
+
+
 @dataclass
 class ServerState:
     """Everything an `OpenAIHandler` needs, built once at startup and shared
@@ -284,14 +357,36 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "owned_by": "nunspark",
                 }],
             })
+        elif self.path.startswith("/v1/models/"):
+            self._write_json(200, {
+                "id": self.state.model_name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "nunspark",
+            })
+        elif self.path == "/v1/models/list":
+            self._write_json(200, {
+                "data": [{
+                    "id": self.state.model_name,
+                    "type": "model",
+                    "display_name": self.state.model_name,
+                    "created_at": "2024-01-01T00:00:00Z",
+                }],
+            })
         else:
             self._write_error(404, f"Not found: {self.path}", code="not_found")
 
     def do_POST(self) -> None:
-        if self.path not in ("/v1/chat/completions", "/chat/completions"):
+        if self.path in ("/v1/chat/completions", "/chat/completions"):
+            self._handle_openai_chat()
+        elif self.path in ("/v1/messages", "/messages"):
+            self._handle_anthropic_message()
+        else:
             self._write_error(404, f"Not found: {self.path}", code="not_found")
-            return
 
+    # -- OpenAI chat -----------------------------------------------------------
+
+    def _handle_openai_chat(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -326,6 +421,57 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self._stream_chat_completion(prompt_ids, temperature, max_tokens, stops)
             else:
                 self._chat_completion(prompt_ids, temperature, max_tokens, stops)
+
+    # -- Anthropic messages ----------------------------------------------------
+
+    def _handle_anthropic_message(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as e:
+            self._write_json(400, anthropic_error_response(f"Invalid JSON: {e}"))
+            return
+
+        messages = body.get("messages")
+        if not messages:
+            self._write_json(400, anthropic_error_response("'messages' is required"))
+            return
+
+        # Accept any model name — local server only has one model loaded.
+        model = body.get("model") or self.state.model_name
+
+        # Anthropic puts system as a top-level field, not in messages.
+        system_text = body.get("system")
+        chat_messages = []
+        if system_text:
+            if isinstance(system_text, list):
+                # Anthropic allows system to be a list of content blocks.
+                system_text = " ".join(
+                    b.get("text", "") for b in system_text if b.get("type") == "text")
+            chat_messages.append({"role": "system", "content": system_text})
+        chat_messages.extend(messages)
+
+        try:
+            prompt_ids = self.state.tokenizer.apply_chat_template(
+                chat_messages, add_generation_prompt=True, tokenize=True)
+        except Exception as e:
+            self._write_json(400, anthropic_error_response(
+                f"Failed to apply chat template: {e}"))
+            return
+
+        stream = bool(body.get("stream", False))
+        temperature = float(body.get("temperature") or 0.0)
+        max_tokens = int(body.get("max_tokens") or 256)
+        stop_sequences = body.get("stop_sequences") or []
+        stops = stop_id_sequences(self.state.tokenizer, stop_sequences)
+
+        with self.state.lock:
+            if stream:
+                self._stream_anthropic_message(
+                    prompt_ids, temperature, max_tokens, stops)
+            else:
+                self._anthropic_message(
+                    prompt_ids, temperature, max_tokens, stops)
 
     # -- chat completion bodies -----------------------------------------------
 
@@ -399,6 +545,60 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def _anthropic_message(self, prompt_ids, temperature, max_tokens, stops) -> None:
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        text_parts: list[str] = []
+        stop_reason = "max_tokens"
+        completion_tokens = 0
+
+        for event in self._events(prompt_ids, temperature, max_tokens, stops):
+            if event.segment:
+                text_parts.append(event.segment)
+            completion_tokens = event.completion_tokens
+            if event.finish_reason is not None:
+                stop_reason = event.finish_reason
+
+        self._write_json(200, anthropic_message_response(
+            message_id=message_id, model=self.state.model_name,
+            text="".join(text_parts), stop_reason=stop_reason,
+            prompt_tokens=len(prompt_ids), completion_tokens=completion_tokens,
+        ))
+
+    def _write_sse(self, event: str, data: dict) -> None:
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+        self.wfile.flush()
+
+    def _stream_anthropic_message(self, prompt_ids, temperature, max_tokens, stops) -> None:
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        self._write_sse("message_start", anthropic_message_start(
+            message_id=message_id, model=self.state.model_name,
+            prompt_tokens=len(prompt_ids)))
+        self._write_sse("content_block_start", anthropic_content_block_start())
+
+        sent_text = ""
+        completion_tokens = 0
+        stop_reason = "max_tokens"
+
+        for event in self._events(prompt_ids, temperature, max_tokens, stops):
+            if event.segment:
+                self._write_sse("content_block_delta", anthropic_content_block_delta(
+                    index=0, text=event.segment))
+                sent_text += event.segment
+            completion_tokens = event.completion_tokens
+            if event.finish_reason is not None:
+                stop_reason = event.finish_reason
+
+        self._write_sse("content_block_stop", anthropic_content_block_stop())
+        self._write_sse("message_delta", anthropic_message_delta(
+            stop_reason=stop_reason, completion_tokens=completion_tokens))
+        self._write_sse("message_stop", anthropic_message_stop())
+        self._write_sse("ping", anthropic_ping())
+
 
 def build_server(
     packed_dir: str | Path, host: str, port: int, *,
@@ -413,6 +613,8 @@ def build_server(
     accept_top_k: int = 1,
     kv_quant: KVQuant | None = None,
     use_prefix_cache: bool = True,
+    lookahead_prefetch: bool = False,
+    wire_limit: bool = True,
 ) -> tuple[HTTPServer, ServerState]:
     """Load the manifest, engine, and tokenizer, and bind an HTTP server.
 
@@ -428,6 +630,7 @@ def build_server(
     engine = StreamingEngine(
         packed_dir, manifest, budget_bytes=budget_bytes, prefetch=prefetch,
         io_threads=io_threads, warm_window=warm_window,
+        lookahead_prefetch=lookahead_prefetch, wire_limit=wire_limit,
     )
 
     from .generate import check_kv_quant_support

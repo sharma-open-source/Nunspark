@@ -83,6 +83,8 @@ def test_cli_serve_dispatches_to_run_server_with_parsed_args(monkeypatch, tiny_m
         "accept_top_k": 1,
         "kv_quant": None,
         "use_prefix_cache": True,
+        "lookahead_prefetch": False,
+        "wire_limit": True,
     }
 
 
@@ -91,8 +93,8 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
     assert main(["pack", str(tiny_model_dir), str(packed)]) == 0
 
     # --budget now defaults to "auto" (derived from unified RAM); pin RAM so
-    # the resolved byte count is deterministic: 16 GiB -> 6 GiB budget
-    # (auto = 0.75 * (RAM - 8 GiB), the measured 30B optimum on 16 GiB).
+    # the resolved byte count is deterministic: 16 GiB -> 10 GiB budget
+    # (auto = 0.75 * RAM - 2 GiB, the measured WIRED 30B optimum on 16 GiB).
     monkeypatch.setattr("nunspark.sysmem.unified_ram_bytes", lambda: 16 * 2**30)
 
     calls = []
@@ -106,7 +108,7 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
     assert (packed_dir, host, port) == (str(packed), "127.0.0.1", 8080)
     assert kwargs == {
         "model_name": None,
-        "budget_bytes": 6 * 2**30,
+        "budget_bytes": 10 * 2**30,
         "kv_budget": 10**12,
         "prefetch": True,
         "io_threads": 1,
@@ -116,6 +118,8 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
         "accept_top_k": 1,
         "kv_quant": None,
         "use_prefix_cache": True,
+        "lookahead_prefetch": False,
+        "wire_limit": True,
     }
 
 
@@ -128,3 +132,36 @@ def test_cli_kv_bits_flags_parse():
     assert args.kv_bits == 4 and args.kv_group_size == 64
     args = parser.parse_args(["generate", "pk"])
     assert args.kv_bits is None
+
+
+def test_cli_lookahead_flag_parses_default_off_for_all_subcommands():
+    # plan7 M2: --lookahead is opt-in (default off) on generate/serve/bench.
+    parser = build_parser()
+    for sub in (["generate", "pk"], ["serve", "pk"], ["bench"]):
+        args = parser.parse_args(sub)
+        assert args.lookahead is False
+    for sub in (["generate", "pk", "--lookahead"],
+                ["serve", "pk", "--lookahead"],
+                ["bench", "--lookahead"]):
+        args = parser.parse_args(sub)
+        assert args.lookahead is True
+
+
+def test_cli_serve_lookahead_flag_reaches_run_server(monkeypatch, tiny_model_dir, tmp_path):
+    # plan7 M2 gate: the CLI flag must actually reach the engine constructor
+    # kwarg (lookahead_prefetch), mirroring how the other serve dispatch
+    # tests assert plumb-through via the mocked run_server call.
+    packed = tmp_path / "packed"
+    assert main(["pack", str(tiny_model_dir), str(packed)]) == 0
+
+    calls = []
+    monkeypatch.setattr(
+        "nunspark.cli.run_server",
+        lambda packed_dir, host, port, **kwargs: calls.append(kwargs),
+    )
+
+    assert main(["serve", str(packed), "--lookahead"]) == 0
+    assert calls[-1]["lookahead_prefetch"] is True
+
+    assert main(["serve", str(packed)]) == 0
+    assert calls[-1]["lookahead_prefetch"] is False

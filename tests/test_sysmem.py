@@ -3,26 +3,27 @@ from nunspark.cli import _parse_size
 
 
 def test_auto_budget_bytes_16gib():
-    # 0.75 * (16 - 8) = 6 GiB -- the measured 30B optimum on a fresh 16 GB
-    # machine (greedy 4/5/6/8/10 GB sweep = 1.79/2.52/3.23/2.84/1.33 tok/s).
+    # 0.75 * 16 - 2 = 10 GiB -- the measured WIRED 30B optimum on a 16 GB
+    # machine (wired sweep 6/8/9/10/11 GB = 4.59/6.40/6.69/7.79/6.36 tok/s,
+    # scripts/results/wired_limit_ab*.json; live-verified 6.92 tok/s).
     ram = 16 * 2**30
-    assert sysmem.auto_budget_bytes(ram) == 6 * 2**30
+    assert sysmem.auto_budget_bytes(ram) == 10 * 2**30
 
 
 def test_auto_budget_bytes_64gib():
-    # 0.75 * (64 - 8) = 42 GiB (community M1 Max ran comfortably at 44-58 GB).
+    # 0.75 * 64 - 2 = 46 GiB (community M1 Max ran comfortably at 44-58 GB).
     ram = 64 * 2**30
-    assert sysmem.auto_budget_bytes(ram) == 42 * 2**30
+    assert sysmem.auto_budget_bytes(ram) == 46 * 2**30
 
 
 def test_auto_budget_bytes_128gib():
-    # 0.75 * (128 - 8) = 90 GiB (community M5 Max ran fine at 90 GB resident).
+    # 0.75 * 128 - 2 = 94 GiB (community M5 Max ran fine at 90 GB resident).
     ram = 128 * 2**30
-    assert sysmem.auto_budget_bytes(ram) == 90 * 2**30
+    assert sysmem.auto_budget_bytes(ram) == 94 * 2**30
 
 
 def test_auto_budget_bytes_floor():
-    # 4 GiB RAM: 0.75*(4-8) is negative, must clamp to the 2 GiB floor.
+    # 4 GiB RAM: 0.75*4 - 2 = 1 GiB, must clamp to the 2 GiB floor.
     ram = 4 * 2**30
     assert sysmem.auto_budget_bytes(ram) == 2 * 2**30
 
@@ -38,7 +39,7 @@ def test_auto_budget_depends_only_on_total_ram(monkeypatch):
     # probe once starved the budget to the 2 GiB floor on a machine that ran
     # fine at 6 GiB).
     monkeypatch.setattr(sysmem, "unified_ram_bytes", lambda: 16 * 2**30)
-    assert sysmem.auto_budget_bytes() == 6 * 2**30
+    assert sysmem.auto_budget_bytes() == 10 * 2**30
 
 
 def test_unified_ram_bytes_returns_int_or_none():
@@ -48,9 +49,9 @@ def test_unified_ram_bytes_returns_int_or_none():
 
 def test_resolve_budget_auto(monkeypatch):
     monkeypatch.setattr(sysmem, "unified_ram_bytes", lambda: 64 * 2**30)
-    assert sysmem.resolve_budget("auto") == 42 * 2**30
+    assert sysmem.resolve_budget("auto") == 46 * 2**30
     # case-insensitive / whitespace-tolerant
-    assert sysmem.resolve_budget("  Auto  ") == 42 * 2**30
+    assert sysmem.resolve_budget("  Auto  ") == 46 * 2**30
 
 
 def test_resolve_budget_passthrough():
