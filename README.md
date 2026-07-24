@@ -32,7 +32,7 @@ then claws the speed back with three levers that only make sense in the disk-bou
 | Model (4-bit) | Size on disk | tok/s | How |
 |---|---|---|---|
 | Qwen3-30B-A3B (MoE) | 16 GB | **6.9 live / 7.8–8.0 probes** | expert streaming + expert-aware cache + persistent scatter buffers + wired buffer pool (auto budget 10 GB; first run from a cold disk pays a one-time cache-fill ramp — see the `--budget` notes) |
-| Qwen3-30B-A3B (MoE) | 16 GB | **up to 1.54 speculative** | + deep-K spec (M≈7 on reasoning prompts; pre-scatter-fix number — re-benchmark pending) |
+| Qwen3-30B-A3B (MoE) | 16 GB | spec: slower — use greedy | deep-K spec re-benchmarked on the wired baseline (2026-07-24): best arm (K=4) ~6.2 vs 8.0 greedy; the MoE verify pass loads a ~K-wide expert union (4.6–8.2× a greedy token's bytes at K=4–16) while acceptance delivered M=2.5–3.3 — the union tax outruns acceptance at every K |
 | Qwen2.5-32B (dense) | 18 GB | **0.9–1.1** | streaming + deep-K spec |
 | Llama-3.3-70B (dense) | 40 GB | **~0.9** | streaming + deep-K spec |
 | gpt-oss-120b (117B MoE, 59 GB packed) | 64 GB | **1.65–1.96 greedy** | community-verified (M1 Max, 64 GB, v0.5.0) |
@@ -51,7 +51,10 @@ hardware for the 70B, and ~0.5 tok/s for the 30B MoE. Nothing here is a quality 
   wired limit (~0.75 × RAM): past it the macOS compressor returns (11 GB budget → 11.99 GB
   peak crosses the 11.84 GB wire and regresses). The **first** generation after boot pays a
   one-time cache-fill ramp (~2.7 tok/s over a cold 200-token run); later runs warm-start
-  from the OS page cache at full speed.
+  from the OS page cache at full speed. Skip `--draft-model` here: deep-K spec measured
+  slower than greedy at every K on this setup (best K=4 ≈ 6.2 vs 8.0 — the MoE verify
+  union tax outruns acceptance, and the draft + verify activations eat ~1.5 GB of the
+  wire headroom on top).
 - **32–48 GB** → a dense 70B with speculative decoding, e.g. `Llama-3.3-70B-Instruct-4bit`
   with `--draft mlx-community/Llama-3.2-1B-Instruct-4bit` (community: 4.57 tok/s spec vs 3.39
   greedy on code at 64 GB/budget 48GB; 1.16 spec vs 0.10 greedy on a 32 GB M1 Pro at budget

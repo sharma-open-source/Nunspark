@@ -1,5 +1,6 @@
 import http.client
 import json
+import queue
 import threading
 
 import pytest
@@ -184,14 +185,42 @@ def test_error_response_shape():
     }
 
 
+def _start_server(*args, **kwargs):
+    """Build the engine and serve it on ONE thread, mirroring run_server's
+    production topology. MLX arrays are thread-affine (mlx>=0.32 binds them to
+    the constructing thread's streams), so an engine built on the test thread
+    cannot be evaluated on a separate serving thread -- the first generate
+    raises "There is no Stream(cpu, N) in current thread". build_server itself
+    documents the constraint ("MLX GPU operations must happen in the same
+    thread"); we honor it by building where we serve, leaving the test thread
+    to speak HTTP over the socket. Blocks until the server is bound, then
+    returns (server, state, thread) for shutdown_server + thread.join teardown."""
+    ready: queue.Queue = queue.Queue(maxsize=1)
+
+    def _run():
+        try:
+            server, state = build_server(*args, **kwargs)
+        except BaseException as exc:  # surface build failures to the test thread
+            ready.put((None, None, exc))
+            return
+        ready.put((server, state, None))
+        server.serve_forever()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    server, state, exc = ready.get(timeout=60)
+    if exc is not None:
+        thread.join(timeout=5)
+        raise exc
+    return server, state, thread
+
+
 @pytest.fixture
 def running_server(packed_chat_dir):
-    server, state = build_server(
+    server, state, thread = _start_server(
         str(packed_chat_dir), "127.0.0.1", 0,   # port 0 -> OS picks a free port
         budget_bytes=64 * 1024 * 1024, kv_budget=10**12,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     try:
         yield server, state
     finally:
@@ -299,12 +328,10 @@ def test_chat_completions_streaming_reassembles_to_the_same_text(running_server)
 
 
 def test_server_kv_quant_threads_to_state(packed_chat_dir):
-    server, state = build_server(
+    server, state, thread = _start_server(
         str(packed_chat_dir), "127.0.0.1", 0,
         budget_bytes=64 * 1024 * 1024, kv_budget=10**12,
         kv_quant=KVQuant(bits=8, group_size=32))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     try:
         assert state.kv_quant == KVQuant(bits=8, group_size=32)
     finally:
@@ -328,12 +355,10 @@ def test_prefix_cache_enabled_by_default(running_server):
 
 
 def test_no_prefix_cache_flag_disables_slot(packed_chat_dir):
-    server, state = build_server(
+    server, state, thread = _start_server(
         str(packed_chat_dir), "127.0.0.1", 0,
         budget_bytes=64 * 1024 * 1024, kv_budget=10**12,
         use_prefix_cache=False)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     try:
         assert state.prefix_cache is None
     finally:
@@ -358,12 +383,10 @@ def test_prefix_cache_output_matches_cold_server(running_server, packed_chat_dir
     warm_second_again = _chat_text(server, state.model_name, "Tell me about Spain please.")
     assert warm_second_again == warm_second
 
-    cold_server, cold_state = build_server(
+    cold_server, cold_state, cold_thread = _start_server(
         str(packed_chat_dir), "127.0.0.1", 0,
         budget_bytes=64 * 1024 * 1024, kv_budget=10**12,
         use_prefix_cache=False)
-    cold_thread = threading.Thread(target=cold_server.serve_forever, daemon=True)
-    cold_thread.start()
     try:
         assert cold_state.prefix_cache is None
         cold_first = _chat_text(cold_server, cold_state.model_name, "Tell me about France.")

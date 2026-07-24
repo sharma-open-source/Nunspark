@@ -618,13 +618,19 @@ def build_server(
 ) -> tuple[HTTPServer, ServerState]:
     """Load the manifest, engine, and tokenizer, and bind an HTTP server.
 
-    Split out from `run_server` so callers (tests, or anything wanting to run
-    the server on a background thread) can drive `serve_forever` themselves
-    and clean up via `shutdown_server`.
-    
+    Split out from `run_server` so callers can drive `serve_forever`
+    themselves and clean up via `shutdown_server`.
+
     Uses HTTPServer (single-threaded) instead of ThreadingHTTPServer because
     MLX GPU operations must happen in the same thread. Since all GPU operations
-    are already serialized with state.lock, this doesn't lose performance."""
+    are already serialized with state.lock, this doesn't lose performance.
+
+    That same-thread rule binds the CALLER too: mlx>=0.32 pins arrays to the
+    thread that constructed them, so an engine built here cannot be evaluated
+    from a different `serve_forever` thread (the first generate raises "There
+    is no Stream(cpu, N) in current thread"). To serve in the background, call
+    `build_server` AND `serve_forever` on that same background thread -- as
+    `run_server` does inline, and the test fixtures' `_start_server` helper."""
     packed_dir = Path(packed_dir)
     manifest = Manifest.load(packed_dir / "manifest.json")
     engine = StreamingEngine(

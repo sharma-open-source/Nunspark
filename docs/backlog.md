@@ -113,6 +113,27 @@ the target (or for n-gram at large K); keep it available — and maybe ON — wh
 tokenizer-matched, since high-M workloads (reasoning) win ~2x. An adaptive policy
 could watch measured M for a few sweeps and disable spec if M stays below ~K/6.
 
+**Small-K question CLOSED (2026-07-24, wired baseline — GATE FAIL at every K;
+scripts/spec_breakeven_probe.py, scripts/results/spec_breakeven_wired.json).**
+Qwen3-30B + matched Qwen3-0.6B draft, greedy @ 10 GB vs spec @ 9 GB (the draft
+must fit under the 11.84 GB wire), K = 4/8/16, 300 tokens, flushed interleaved
+rounds. Against the clean wired greedy baseline (7.96; today's 8 prior controls
+7.98–8.15): **K=4 −22% best-run (6.19), K=8 −47%, K=16 −59%.** The failure is
+structural on a streamed MoE: measured verify-pass cost = 4.6×/6.7×/8.2× a
+greedy token at K=4/8/16 (union tax — 12–22 expert misses/token vs greedy's
+4.6, 30–56 MB/token vs 11.7) while M = 2.54/2.89/3.33 (deterministic across
+rounds; acceptance 39/24/15%). Break-even needs M ≈ the pass-cost ratio, i.e.
+near-100% acceptance at K=4 — and the union tax grows with K as fast as M's
+ceiling, so NO K escapes. Memory compounds it: spec peaked 11.63 GB MLX memory
+at a 9 GB budget (draft + verify activations ≈ +1.5 GB over greedy), hugging
+the wire and compressing 60–80 GB/run. Recommendation stands and is now fully
+measured for 16 GB streamed MoE: **greedy is the mode; README updated** (spec
+row + 16 GB guidance). The M3-Ultra-class conditional win (huge RAM, high-M
+reasoning) is untouched. The probe's greedy median is contaminated by a 4th
+#15-style ambient-churn sighting (its LAST run: 3.06 tok/s, 130 GB compressed,
+byte-identical cache work) — verdict is robust either way (even vs the
+contaminated median, K=4 is −3.9%).
+
 ## 6. Bench hygiene: matched-draft defaults, draft pre-download, warm-up (MEDIUM)
 
 From the M1 Pro 32 GB 19-run study + follow-up comment (docs/community-results.md,
@@ -224,8 +245,9 @@ that macOS will happily make room for. Auto is a pure function of TOTAL RAM
 in tests/test_sysmem.py; README updated (headline 2.8-3.2 tok/s, scatter-fix bullet,
 16 GB model guide + --budget flag row with the sweep, quickstarts now use auto).
 REMAINING: re-run the standard bench suite + report.md / community-results
-comparisons on 0.9.x, and re-check the spec-decode arms (verify passes shared the
-same scatter tax, so M-vs-win thresholds shift toward greedy).
+comparisons on 0.9.x. ~~Re-check the spec-decode arms~~ **DONE 2026-07-24 on the
+wired baseline: spec loses at every K (best K=4 −22% vs greedy 7.96) — closed
+under #5's small-K entry (spec_breakeven_wired.json).**
 Original finding follows.
 
 Original entry (pre-fix measurements):
@@ -347,6 +369,75 @@ TensorFold-style adoption review (cf. #7):
   (clear between arms), and per-prompt autocorrelation (validate across
   prompts, not within one).
 
+## 15. Startup bulk prewarm — MEASURED 2026-07-24, GATE FAIL (redundant with prefill warm_bulk; do not revisit as-proposed)
+
+**Idea (from #14 follow-ups / #13 C2's parked "cold-start warming").** The
+first cold run at the wired 10 GB budget looked ramp-dominated (live: 2.68
+tok/s over 200 tokens), so sequential-read the cache full at engine load
+(dense/core first, then experts round-robin across layers, capped at the
+budget) before the first token — a one-shot known-in-advance bulk read.
+
+**Probe** (scripts/startup_prewarm_probe.py,
+scripts/results/startup_prewarm_ab.json; M4 16 GB, Qwen3-30B, 10 GB budget,
+200 greedy tokens, 3 ABBA pairs, both arms wired/shipped defaults, page cache
+flushed before every run, per-token window speeds, token streams
+byte-identical):
+
+- **Gate metric (end-to-end wall incl. prewarm): control 30.82 s vs prewarm
+  31.99 s median (−3.8%)**; pairs +47.8/−12.2/−3.3% — fails both clauses of
+  the ≥10%-median / no-pair-worse-than-5% gate.
+- **Mechanism: the prewarm is redundant.** Decode-segment misses were
+  byte-identical in all 6 runs across BOTH arms (1167 expert misses /
+  2.885 GB / 14.8 MB-per-token — deterministic greedy). The 42-token
+  prefill's existing warm_bulk (#1) already bulk-fills the cache and page
+  cache at 2–3 GB/s; prewarm-arm prefill was 3.9 s vs control 4.0 s — there
+  was nothing left for the 3.2 s / 10 GB / ~3 GB/s prewarm to win, so it
+  costs its own runtime back.
+- What it did buy (why a variant could be argued later, on tail latency
+  only): a softer ramp (first-50-token window median 7.11 vs 5.69 tok/s,
+  expert stall 3.56 vs 4.48 s) and a tight worst case (arm spread
+  31.8–33.5 s vs control 28.5–64.1 s).
+- **The real cold-start story changed.** The one catastrophic run
+  (control-run1: 64 s, prefill 14.9 s, first-50 2.59 tok/s) is the only run
+  matching the live first-run complaint, and its signature is COMPRESSOR
+  churn — 35.7 GB compressed / 2.3M compressions, ~2× every other run — in
+  the first process after a long idle (the #10 hygiene note's known
+  first-runs-read-low effect). It is NOT page-cache coldness: controls 2/3
+  paged in the same ~13 GB from disk (845–897k pageins) and ran fast
+  (28.5/30.8 s). Two consequences: (a) the house flush manufactures cold
+  DISK state but not the true first-run-of-the-day state, so that state is
+  unprobed (n=1 per arm); (b) #14's "first live run was cache fill at
+  demand-fault speed" reading was incomplete — the fill is normally absorbed
+  by prefill warm_bulk at bulk bandwidth; it is the compressor fight that
+  makes the first run slow.
+
+**Verdict: do not ship a startup prewarm as-designed.** If the
+first-run-of-the-day slowness recurs live, the follow-up is characterizing
+that state (compressor churn in the first process after idle — e.g. does a
+second immediate run always fix it? does a small warm-up generation at serve
+startup?), not more bulk reading. Any insurance-style prewarm revival must be
+argued on tail latency with a probe that can actually manufacture the true
+cold state.
+
+**Third sighting (2026-07-24, lookahead wired re-run):** the first run of
+that session — a control — hit 3.81 tok/s with 19.66 s stall and 39.4 GB
+compressed vs 7.98–8.15 for every later control (identical config). Same
+signature every time: FIRST child process of a session, ~2× the compressor
+traffic, no excess disk reads. The pattern is now consistent enough to
+probe deliberately (idle-gap-controlled A/B: does a ~30-token throwaway
+generation at process start, or an immediate second run, always restore
+full speed?).
+
+**Fourth sighting (2026-07-24, spec break-even probe) — and it is NOT only
+a first-run effect:** the LAST run of that session (a greedy control) hit
+3.06 tok/s with 130 GB compressed (4.3× its clean twin) on byte-identical
+cache work (1382 misses / 3.416 GB both runs), after six spec runs that
+each compressed 60–80 GB. So the trigger looks like ambient compressor
+state (accumulated or inherited), not process order per se. Contaminated
+that probe's greedy median (verdict robust anyway). Any future probe on
+this machine should treat per-run `compressed_gb_during_run` as a validity
+check (clean runs: 15–20 GB) and re-run outliers.
+
 ## 14. Wired-memory limit: the budget cliff is a wiring artifact (MEASURED 2026-07-24 — GATE PASS, ship it)
 
 **Finding.** NunSpark never called `mx.set_wired_limit()`, so the entire piece
@@ -408,7 +499,9 @@ run, wired limit 11.84 GB = device max_recommended):
    10/16 coverage ratio even a uniform fill gives a ~62% hit floor from
    token 1, and unlike the dead per-token decode warming (#9/Phase-1) it is
    a one-shot known-in-advance bulk read, the same mechanism that made
-   prefill warm_bulk (#1) a 2× win.
+   prefill warm_bulk (#1) a 2× win. **(Measured 2026-07-24: GATE FAIL — see
+   #15. Prefill warm_bulk already does this fill; the live first-run
+   slowness is compressor churn, not page-cache coldness.)**
 3. ~~Ship set_wired_limit~~ **SHIPPED 2026-07-24** (uncommitted):
    `sysmem.wire_memory_limit()` sets the limit to the device
    max_recommended_working_set_size; `StreamingEngine(wire_limit=True)`
@@ -426,9 +519,17 @@ run, wired limit 11.84 GB = device max_recommended):
    retired with attribution to the wiring artifact. 64/128 GB values sit
    inside community-verified unwired ranges (44–58 / 90 GB ran fine);
    wired re-verification from community machines welcome.
-5. Re-run candidates on the new wired baseline: the Plan-7 lookahead M3 gate
-   (#9 — it failed partly on control variance that wiring removes) and the
-   spec-vs-greedy break-evens (#5, #10 REMAINING).
+5. Re-run candidates on the new wired baseline: ~~the Plan-7 lookahead M3
+   gate~~ **DONE 2026-07-24 — FAIL again, FINAL** (top8 +1.5%, top12 −5.9%
+   median at 10 GB wired; with variance gone there was no gate-sized win to
+   mask — expert stall is only ~14% of decode at this baseline, so any
+   prefetch win is bounded to low single digits. Details in
+   docs/plan7-lookahead.md "M3 wired re-run" +
+   scripts/results/lookahead_wired_ab.json; do not re-gate on this hardware
+   class — check the stall share first on any new machine/model). ~~The
+   spec-vs-greedy break-evens (#5, #10)~~ **DONE 2026-07-24 — spec loses at
+   every K on the wired baseline (best K=4 −22%); closed under #5's small-K
+   entry (spec_breakeven_wired.json). All #14 follow-ups are now closed.**
 
 ## 12. DeepSeek-V4-Flash (`deepseek_v4`) — BLOCKED on upstream mlx-lm (assessed 2026-07-20)
 
