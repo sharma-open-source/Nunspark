@@ -85,6 +85,8 @@ def test_cli_serve_dispatches_to_run_server_with_parsed_args(monkeypatch, tiny_m
         "use_prefix_cache": True,
         "lookahead_prefetch": False,
         "wire_limit": True,
+        "compact_scatter": False,
+        "eval_window": 1,
     }
 
 
@@ -120,6 +122,8 @@ def test_cli_serve_uses_documented_defaults(monkeypatch, tiny_model_dir, tmp_pat
         "use_prefix_cache": True,
         "lookahead_prefetch": False,
         "wire_limit": True,
+        "compact_scatter": False,
+        "eval_window": 1,
     }
 
 

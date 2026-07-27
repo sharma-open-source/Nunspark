@@ -113,6 +113,18 @@ def build_parser() -> argparse.ArgumentParser:
                             "current residual stream and speculatively stage its "
                             "predicted experts. Output-identical to off; prefetch only. "
                             "Opt-in, off by default")
+    p_gen.add_argument("--compact-scatter", action="store_true",
+                       help="experimental compact fired-only expert scatter (plan8): "
+                            "pack the ~k fired experts into a [k, ...] buffer instead of "
+                            "scattering into full [num_experts, ...] buffers. "
+                            "Output-identical to off; the scatter was the #1 decode "
+                            "bucket (backlog #16). Opt-in, off by default")
+    p_gen.add_argument("--eval-window", type=int, default=1, metavar="W",
+                       help="drain the per-layer eval barrier every W-th layer "
+                            "instead of every layer (plan9), pipelining ~W layers. "
+                            "Output-identical to W=1; measured +7.6%% decode at W=3 "
+                            "on the 30B (wire-guarded so it can't churn). Opt-in, "
+                            "default 1 (off)")
     p_gen.add_argument("--no-wire", dest="wire", action="store_false",
                        help="don't raise the MLX wired-memory limit at startup. "
                             "Default is to wire it to the device's recommended "
@@ -162,6 +174,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "current residual stream and speculatively stage its "
                               "predicted experts. Output-identical to off; prefetch only. "
                               "Opt-in, off by default")
+    p_serve.add_argument("--compact-scatter", action="store_true",
+                         help="experimental compact fired-only expert scatter (plan8): "
+                              "pack the ~k fired experts into a [k, ...] buffer instead "
+                              "of full [num_experts, ...] buffers. Output-identical to "
+                              "off (backlog #16). Opt-in, off by default")
+    p_serve.add_argument("--eval-window", type=int, default=1, metavar="W",
+                         help="drain the per-layer eval barrier every W-th layer "
+                              "instead of every layer (plan9), pipelining ~W layers. "
+                              "Output-identical to W=1; measured +7.6%% decode at W=3 "
+                              "on the 30B (wire-guarded so it can't churn). Opt-in, "
+                              "default 1 (off)")
 
     p_web = sub.add_parser("web", help="launch the local web interface")
     p_web.add_argument("--packed-root", default="models",
@@ -240,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
             expert_prefetch=args.expert_prefetch,
             lookahead_prefetch=args.lookahead,
             wire_limit=args.wire,
+            compact_scatter=args.compact_scatter,
+            eval_window=args.eval_window,
         )
         try:
             from .generate import check_kv_quant_support
@@ -575,6 +600,8 @@ def main(argv: list[str] | None = None) -> int:
                 use_prefix_cache=args.use_prefix_cache,
                 lookahead_prefetch=args.lookahead,
                 wire_limit=args.wire,
+                compact_scatter=args.compact_scatter,
+                eval_window=args.eval_window,
             )
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)

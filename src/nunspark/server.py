@@ -615,6 +615,8 @@ def build_server(
     use_prefix_cache: bool = True,
     lookahead_prefetch: bool = False,
     wire_limit: bool = True,
+    compact_scatter: bool = False,
+    eval_window: int = 1,
 ) -> tuple[HTTPServer, ServerState]:
     """Load the manifest, engine, and tokenizer, and bind an HTTP server.
 
@@ -637,6 +639,7 @@ def build_server(
         packed_dir, manifest, budget_bytes=budget_bytes, prefetch=prefetch,
         io_threads=io_threads, warm_window=warm_window,
         lookahead_prefetch=lookahead_prefetch, wire_limit=wire_limit,
+        compact_scatter=compact_scatter, eval_window=eval_window,
     )
 
     from .generate import check_kv_quant_support

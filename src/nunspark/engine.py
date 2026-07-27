@@ -19,6 +19,19 @@ from .piece_cache import PieceCache
 from .sysmem import wire_memory_limit
 
 
+def _active_memory() -> int:
+    """Current MLX active (live) device memory in bytes; 0 when the API is
+    unavailable. Used only by the eval_window guard — reading it is a cheap
+    counter read, not a device sync, and a 0 fallback disables the guard (pure
+    windowing), which the opt-in flag accepts."""
+    getter = getattr(mx, "get_active_memory", None) or getattr(
+        getattr(mx, "metal", None), "get_active_memory", None)
+    try:
+        return int(getter()) if getter else 0
+    except Exception:
+        return 0
+
+
 def _quant_base_config(quant: dict | None) -> dict | None:
     """The top-level (base) quantization config: the scalar entries that apply
     to every module without an explicit per-path override. None for fp16 models.
@@ -204,6 +217,8 @@ class StreamingEngine:
         lookahead_depth: int = 1,
         lookahead_topn: int = 12,
         wire_limit: bool = True,
+        compact_scatter: bool = False,
+        eval_window: int = 1,
     ):
         # Wire the MLX buffer pool BEFORE anything is allocated: unwired, the
         # macOS compressor steals the piece cache under memory pressure (the
@@ -301,6 +316,33 @@ class StreamingEngine:
         # Persistent full-size expert scatter buffers (see _scatter_experts);
         # built lazily on first scatter, invalidated by _make_slot.
         self._scatter_bufs: dict | None = None
+        # Compact fired-only expert scatter (Plan 8 / backlog #16). Off by default
+        # until the M3 gate passes. When on, _scatter_experts packs the ~k fired
+        # experts into a fresh [k, ...] buffer (rows 0..k-1) and remaps the router
+        # inds to 0..k-1, instead of scattering into full-size [num_experts, ...]
+        # buffers — the scatter+eval was the #1 decode bucket (36%, backlog #16).
+        # Bit-identical to the full path (M0 gate, test_compact_scatter_numerics).
+        self._compact_scatter = bool(compact_scatter)
+        self.compact_rows_scattered = 0   # cumulative k across compact scatters
+        # Windowed per-layer eval (Plan 9 / backlog #16). Opt-in: drain the layer
+        # barrier every W-th layer instead of every layer, letting MLX pipeline
+        # ~W layers (compute of layer N overlapping N+1's router-tolist + scatter +
+        # fetch). W=1 == today's per-layer eval, EXACTLY. Measured +7.6% decode at
+        # W=3 on the 30B @ 10 GB, bit-identical, churn-free at W<=4
+        # (windowed_eval_probe.json) — below the 10% default-on bar, hence opt-in.
+        # The barrier is memory-load-bearing (a deferred eval keeps that layer's
+        # weights live via the lazy graph), so a wire-proximity guard forces a
+        # drain when active memory nears the wired limit — a tighter budget / bigger
+        # model can never churn from windowing. Counter is process-global; the
+        # per-token tail always drains via the logits/sample eval regardless of W.
+        self._eval_window = max(1, int(eval_window))
+        self._sync_counter = 0
+        # Force a drain at this active-memory ceiling even mid-window (guard). None
+        # when the wire/API is unavailable -> pure windowing (opt-in accepts that).
+        self._eval_window_mem_ceiling = (
+            int(self.wired_limit_bytes * 0.90)
+            if (self._eval_window > 1 and self.wired_limit_bytes) else None
+        )
         self._stall_seconds = 0.0    # cumulative router-output -> experts-resident wait
         self._block_factory = spec.block_factory
         self._layer_key_fn = spec.layer_key_fn
@@ -468,9 +510,26 @@ class StreamingEngine:
         consumption of each pass. mx.eval is scheduling-only — it never changes
         numerics — so skipping is bit-identical. Note first-touch materialization
         on fetch/miss (mx.eval in _materialize / _scatter_experts) is a SEPARATE,
-        always-on force-read and is unaffected by this."""
-        if not self._fully_resident:
+        always-on force-read and is unaffected by this.
+
+        Windowed eval (Plan 9, opt-in `eval_window=W>1`): drain every W-th layer
+        instead of every layer, so MLX pipelines ~W layers (compute of one over the
+        host prep of the next). Still bit-identical (scheduling-only). Because a
+        deferred eval keeps that layer's weights live in the lazy graph (bounding
+        peak memory is the barrier's real job), a wire-proximity guard forces a
+        drain when active memory nears the wired limit — windowing can never
+        push a tight budget into compressor churn."""
+        if self._fully_resident:
+            return h
+        if self._eval_window == 1:
+            mx.eval(h)                       # default: exact per-layer behavior
+            return h
+        self._sync_counter += 1
+        ceil = self._eval_window_mem_ceiling
+        if self._sync_counter % self._eval_window == 0 or (
+                ceil is not None and _active_memory() >= ceil):
             mx.eval(h)
+            self._sync_counter = 0           # realign the window after a forced drain
         return h
 
     def _slot_class_predicate(self, layer_idx: int):
@@ -548,21 +607,36 @@ class StreamingEngine:
         fired, from_multi = rec
         return fired if from_multi else []
 
-    def _scatter_experts(self, slot, layer: int, fired: list[int]) -> None:
-        """Load only the `fired` experts and scatter their rows into full-size
-        PERSISTENT expert-module buffers, then update the slot. Unfired rows are
-        never gathered by the expert module's forward (it gathers exactly the
-        router's `inds`), so output is bit-identical to loading all experts —
-        which is also why the buffers need no re-zeroing between layers: a stale
-        row from a previous layer is exactly as unreachable as a zero row.
-        Rebuilding zero-filled buffers every layer of every token was measured at
-        59-70% of streaming decode wall time (~15 GB of transient writes per
-        token; scripts/results/decode_time_attribution.json) vs ~45 ms/token for
-        the persistent row-scatter (scripts/results/scatter_strategy_microbench
-        .json). Each piece's rows are still copied in immediately
-        (scatter-then-discard), so a budget too small to keep pieces resident is
-        still correct. The buffer set is invalidated in _make_slot whenever the
-        slot's structural variant (and thus the expert shapes) changes."""
+    def _scatter_experts(self, slot, layer: int, fired: list[int]):
+        """Load only the `fired` experts, host them in the expert-module buffers,
+        and update the slot. Unfired rows are never gathered by the expert
+        module's forward (it gathers exactly the router's `inds`), so output is
+        bit-identical to loading all experts.
+
+        Two hosting strategies:
+
+        - Default (full): scatter each fired expert `e`'s rows into a full-size
+          PERSISTENT `[num_experts, ...]` buffer at its global index `e`; the
+          router's `inds` address it directly. Buffers need no re-zeroing between
+          layers (a stale row is as unreachable as a zero row) and are invalidated
+          in _make_slot on a structural-variant change. Rebuilding zero-filled
+          buffers every layer was measured at 59-70% of decode
+          (decode_time_attribution.json) vs ~45 ms/token for this persistent
+          row-scatter (scatter_strategy_microbench.json). Returns None.
+
+        - Compact (Plan 8 / backlog #16, `_compact_scatter`): pack the k fired
+          experts into a `[k, ...]` buffer via one `mx.stack` per subkey (rows
+          0..k-1) and return a global->local index map so the caller can remap
+          `inds` to 0..k-1. Bit-identical to the full path — per (token, selected
+          expert) the gathered rows are the same; only their storage index and
+          the addressing inds change (M0 gate, test_compact_scatter_numerics.py).
+          The build MUST be stack, not fresh-zeros+setitem: M2
+          (scatter_strategy_microbench, plan8) measured stack the only compact
+          form that beats the persistent-full path (−11% at decode k=8), while
+          zeros+setitem re-commits the #10 realloc/zero cost and regressed (+26%).
+          NOTE (plan8 M2): even stack's greedy-decode win is ~3-4% end-to-end,
+          under the M3 gate, so this flag stays default-OFF; its real potential is
+          the multi-token verify-union scatter (backlog #17), not greedy decode."""
         attr = self._expert_attr
         sw = getattr(slot.mlp, attr)
         subkeys = [
@@ -571,6 +645,39 @@ class StreamingEngine:
             for comp in ("weight", "scales", "biases", "bias")
             if comp in getattr(sw, proj)            # fp16: weight[,bias]; 4-bit: + scales/biases
         ]
+
+        if self._compact_scatter:
+            k = len(fired)
+            # Stall = the disk/cache wait to make the k fired pieces resident.
+            # The mx.stack builds below are lazy graph nodes; the real wait is
+            # inside get(), which returns only once the piece is materialized.
+            t0 = time.monotonic()
+            loaded = [self.cache.get(Manifest.layer_expert_piece_id(layer, e))
+                      for e in fired]
+            self._stall_seconds += time.monotonic() - t0
+            # Pack the k fired experts into [k, ...] compact buffers with a single
+            # mx.stack per subkey -- NO fresh zero-fill and NO per-row setitem
+            # nodes. M2 (scatter_strategy_microbench) measured this the ONLY
+            # compact form that beats the persistent-full default: zeros+setitem
+            # re-commits the #10 realloc/zero cost and REGRESSED (+26% at decode).
+            # Bit-identical to the full path either way -- same gathered rows;
+            # only the storage index and the addressing inds change.
+            flat = {
+                f"mlp.{attr}.{proj}.{comp}":
+                    mx.stack([p[f"mlp.{attr}.{proj}.{comp}"] for p in loaded])
+                for proj, comp in subkeys
+            }
+            mx.eval(list(flat.values()))    # force reads now; cached pieces may be evicted next
+            slot.update(tree_unflatten(list(flat.items())))
+            # global expert id -> compact row 0..k-1. num_experts comes from the
+            # spec/args (a STABLE source): the slot is reused across layers and its
+            # weight is now [k, ...], so weight.shape[0] would lie (plan8 #6).
+            lut = [0] * self._num_experts
+            for j, e in enumerate(fired):
+                lut[e] = j
+            self.compact_rows_scattered += k
+            return mx.array(lut)
+
         bufs = self._scatter_bufs
         if bufs is None:
             bufs = self._scatter_bufs = {
@@ -592,6 +699,7 @@ class StreamingEngine:
         flat = {f"mlp.{attr}.{proj}.{comp}": buf
                 for (proj, comp), buf in bufs.items()}
         slot.update(tree_unflatten(list(flat.items())))
+        return None
 
     _TRACE_FLUSH_EVERY = 256  # records buffered before a write, so tracing doesn't distort timing
 
@@ -691,7 +799,7 @@ class StreamingEngine:
         if self._cur_pass_multi or self._decode_bulk_warm:
             self.cache.warm_bulk(
                 Manifest.layer_expert_piece_id(layer, e) for e in fired)
-        self._scatter_experts(slot, layer, fired)
+        remap = self._scatter_experts(slot, layer, fired)
         if self._expert_prefetch:
             # Remember this pass's fired set so the NEXT pass can prefetch it.
             # Recorded here (after any L+1..W speculative prefetch already read the
@@ -703,7 +811,12 @@ class StreamingEngine:
             # pass overlaps 0.74-0.80 with the next.
             self._fired_history[layer] = (fired, batch_tokens > 1)
 
-        y = getattr(slot.mlp, self._expert_attr)(x, inds)
+        # Compact scatter (Plan 8) hosts fired experts at rows 0..k-1, so the
+        # router's global `inds` must be remapped to those local rows; the full
+        # path stores at global index and remap is None. `fired` above stays
+        # global for history/prefetch/trace — only the expert-module gather moves.
+        call_inds = inds if remap is None else remap[inds]
+        y = getattr(slot.mlp, self._expert_attr)(x, call_inds)
         mix = (y * scores[..., None]).sum(axis=-2)
         if self._moe_mix_cast:
             # deepseek-style routers emit fp32 scores; the reference casts the
@@ -817,6 +930,8 @@ class StreamingEngine:
         return {
             "stall_seconds": self._stall_seconds,
             "speculative": self.cache.stats()["speculative"],
+            "compact_rows_scattered": self.compact_rows_scattered,
+            "eval_window": self._eval_window,
         }
 
     def _padded_mask_index(self, h: mx.array, kv, pad_lengths: mx.array):

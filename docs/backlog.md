@@ -580,3 +580,228 @@ fp8 block weights with fp4 experts. Streaming-contract breaks, hardest first:
 **Do NOT** pre-implement against the PR branch "to be ready" — the PR's own
 instability means any pre-built parity target is sand. Re-check this entry
 when bumping mlx-lm for any other reason.
+
+## 16. Decode is BARRIER-bound, not disk-bound (MEASURED 2026-07-27, wired baseline — promotes #10 candidate (a)) → Plan 8
+
+**Finding.** Re-ran the decode time-attribution probe on the shipped WIRED
+10 GB baseline (scripts/decode_time_attribution_wired.py — the #14 follow-up
+the old 2026-07-17 attribution never got; that one predated both the #10
+scatter fix and #14 wiring). Qwen3-30B, 199 greedy decode tokens, warm start,
+CLEAN run (7.9 GB compressed, well inside the 15–20 GB clean band — not a #15
+contamination). Result: scripts/results/decode_attribution_wired.json.
+
+6.80 tok/s / 147.1 ms per token, attributed:
+
+| bucket | ms/tok | % | what |
+|---|---|---|---|
+| **scatter_minus_stall** | 53.5 | **36%** | setitem-scatter of fired experts into full-size [128,…] persistent bufs + the per-layer `mx.eval` at engine.py:591 |
+| router_sync | 28.4 | 19% | `inds.tolist()` host sync — drains attention + router |
+| layer_sync | 28.3 | 19% | `mx.eval(h)` — drains the expert FFN matmul |
+| stall_demand_load | 25.0 | **17%** | actual disk I/O wait (5.86 expert misses/token) |
+| other_python | 7.4 | 5% | orchestration |
+| head_sample | 4.5 | 3% | argmax |
+
+**Two model-flipping facts:**
+
+1. **Disk I/O is only 17% of decode on 16 GB.** After #10 + #14, streaming is
+   no longer the bottleneck this project was built to fight — decode is **~74%
+   host-sync barriers** (scatter-eval 36% + router-tolist 19% + layer-eval 19%),
+   three host↔device round-trips per MoE layer × 48 layers ≈ 144 pipeline
+   drains per token with no cross-layer overlap. This is WHY every I/O-targeted
+   lever is now measured dead (#5 spec, #9 lookahead, #15 prewarm, #9 decode
+   warm): they all attack a 17% slice. The remaining win is in the barriers.
+2. **The scatter is still the #1 bucket and costs MORE than the compute it
+   feeds** — 53.5 ms scattering ~8 experts' rows > attention+router (28) >
+   expert FFN matmul (28). #10 shipped candidate **(b)** persistent buffers and
+   killed the re-zeroing (524–789 → 53 ms/tok, ~10×), but kept **full-size
+   [128,…] buffers** and a per-layer forcing `mx.eval`. #10's deferred,
+   never-measured candidate **(a) — compact fired-only [k,…] buffers, inds
+   remapped 0..k-1, ~16× fewer scatter bytes — is exactly where the time now
+   sits.**
+
+**Next lever (promoted to Plan 8):**
+- **(a) Compact fired-only expert buffers.** Scatter into `[k,…]` with a
+  0..k-1 index remap instead of full `[128,…]`. Directly attacks the 36%
+  bucket. NEEDS A NUMERICS GATE: the switch/SwitchGLU matmul must be
+  bit-identical under remapped inds (the cross-shape fp16 caution #10 flagged
+  — losslessness is the product; do not weaken test_engine_forward /
+  test_scatter_persistent_bufs to pass).
+- **Stacks: drop/merge the per-layer `mx.eval` at engine.py:591.** It exists
+  only for eviction-safety ("cached pieces may be evicted next"). Pin the ~8
+  fired pieces against eviction until the layer's compute drains, then fold
+  that barrier into the existing `layer_sync` (659) — 2 drains → 1 per layer.
+  Lossless (memory policy only).
+
+Realistic combined upside: a chunk of the 55% held by scatter_minus_stall +
+layer_sync. Gate it (offline numerics → scatter micro-bench → flushed real-model
+A/B) like every other optimization. Spec: docs/plan8-compact-scatter.md.
+
+**M0 numerics gate PASSED 2026-07-27** (tests/test_compact_scatter_numerics.py,
+4/4): a prototype compact-scatter (fresh [k,…] bufs + 0..k-1 inds remap,
+monkeypatched onto _moe_attn_and_mix) is BIT-IDENTICAL to the stock streamed
+engine across prefill + 8 decode steps on qwen3_moe + gpt_oss × fp16 + 4-bit —
+so the fp16-tiling risk that deferred candidate (a) under #10 does not
+materialize (M3 re-confirms at real scale). The probe also caught a real M1
+constraint: the engine reuses ONE slot across layers, so num_experts must come
+from the router (gate_logits.shape[-1]), never the compacted weight (plan8
+constraint #6). Next: Plan 8 M1 (engine impl behind compact_scatter=False).
+
+**M2 micro-bench (2026-07-27, scatter_strategy_microbench.json; qwen3-30b,
+128 experts, 360 MB/layer, scatter+eval isolated from disk+FFN, 48 sim-layers).**
+Surprise result that redirects the plan. At decode k=8 (ms/token, 48 layers):
+- A fresh-full-zeros (pre-#10) = 267.4  (confirms #10: never realloc+zero-fill)
+- **B persistent full [128,…] (shipped DEFAULT) = 45.2**  ← baseline
+- **D compact [k,…] zeros+setitem (shipped M1 compact branch) = 56.8**  ← a
+  REGRESSION (+26% vs B): the per-layer fresh-alloc + zero-fill + k setitem
+  graph nodes cost MORE than the bytes saved by evaling [8,…] vs [128,…]. My M1
+  deviation from plan8 constraint #5 (fresh [k,…] instead of a persistent slice)
+  is measured WRONG — it re-committed the #10 sin.
+- **C compact [k,…] via mx.stack = 40.3**  ← the ONLY compact form that beats B
+  (−11% at decode). Stack fuses the build (one op, no separate zero-fill), so
+  its small fresh alloc + small [8,…] eval < B's big [128,…] eval.
+At verify-union k=70: B=325.2, D=404.9 (regression again), C=226.6 (−30% vs B).
+Takeaways: (1) compaction helps ONLY via stack, not zeros+setitem — the #10
+"don't realloc/zero per layer" lesson dominates the byte-count savings; (2) even
+C's decode win is ~5 ms/tok of the 45 ms scatter bucket = ~0.11·36% ≈ **3–4%
+end-to-end at greedy k=8 — UNDER the M3 ≥10% bar**; (3) C's big win (−30%) is at
+verify-union k, which only helps MULTI-TOKEN verify (speculative/tree) passes,
+not the single-token greedy decode #16 measured. So Plan 8 as scoped (greedy
+decode) will not clear M3; its real potential home is speculative verify scatter
+(a separate, unmeasured direction). The shipped M1 flag (mechanism D) is a latent
+regression and must be switched to stack (C) or removed before it can be trusted
+on. Next decision: record dead-for-decode + fix/remove the flag, vs re-scope to a
+speculative-verify attribution.
+
+**Before scoping the barrier direction (router_sync 19% + layer_sync 19%): VERIFY
+it's a real lever, not drained compute.** The #16 buckets are timers around
+host<->device syncs (`inds.tolist()`, `mx.eval`), but in a lazy/async engine a
+sync is where queued GPU work DRAINS — so attributed time can be compute measured
+at the barrier, not removable overhead. Two scaffolded probes decide it before any
+plan (2026-07-27, both py-parse OK, pending Mac run):
+- `scripts/barrier_cost_probe.py` (Probe 1) — prices the barriers: per-`mx.eval`
+  round-trip floor + per-`tolist` read-back floor × the ACTUAL sync count/token
+  (evals wrapped+counted over a real decode; router tolist = n_moe_layers,
+  structural). GO/NO-GO: floor << (router+layer_sync) ⇒ those buckets are drained
+  COMPUTE ⇒ barrier reduction is NOT the lever, stop.
+- `scripts/barrier_headroom_probe.py` (Probe 2) — the decisive one, an EXACT
+  bit-identical A/B of the per-layer `mx.eval(h)` via the existing
+  `_fully_resident` toggle (engine.py:_sync_layer; the skip is certified
+  scheduling-only). Experts resident (disk out), ABBA-interleaved, asserts
+  identical greedy streams. gap = recoverable `layer_sync` tax = the M4 ceiling.
+  Needs a pack that FITS the budget (per-layer tax generalizes to 30B by layer
+  count); refuses otherwise (toggling the barrier off under eviction is lossy).
+Run Probe 1 first (kills/greenlights for ~nothing), then Probe 2 if it survives.
+NOTE: router_sync (the tolist) is likely IRREDUCIBLE — selective streaming must
+read routing on host to know which experts to fetch (#9 lookahead already died
+avoiding it); Probe 2 toggles only layer_sync, and router_sync should be crossed
+off by construction unless a probe shows otherwise.
+
+**RESULTS 2026-07-27 (qwen3-30b, 16 GB M4):**
+- **Probe 1 CLEAN, GREENLIGHTS the direction.** Round-trip floors L_eval=0.219,
+  L_tolist=0.181, L_item=0.184 ms; measured 116.6 mx.eval/token (~2.4/layer:
+  scatter + layer eval) + 48 structural tolist. **sync FLOOR = 34.4 ms/token =
+  61% of the 55.9 ms router+layer_sync bucket.** So the barrier time is real
+  host<->device round-trips, NOT drained compute — barrier merge/pin can pay.
+- **Probe 2 FIRST RUN INVALID (probe bug, now fixed).** It reported ON=193.6 /
+  OFF=98.1 ms, gap 49% — but the run was CONFOUNDED: `_fully_resident` is a
+  byte-BUDGET check, so a 64 GB nominal budget made it True while the 30B does not
+  PHYSICALLY fit 16 GB → the A/B ran under OS compressor/paging (#15), not "disk
+  out." Tells: raw on1=278 vs on2=108 (2.6× spread = churn), and gap 95 ms >
+  the whole 28 ms layer_sync bucket (impossible if it only gates that barrier).
+  Streams stayed identical (OS paging is lossless) so it wasn't caught by the
+  loss check. FIX: guard now refuses unless model footprint ≤ 0.60·unified RAM
+  (physical, via sysmem.unified_ram_bytes), sizes budget to footprint+2 GB, and
+  flags same-arm spread > 25% as churn → INVALID. **Re-run on a pack that fits 16
+  GB (an 8B, or a smaller MoE); the per-layer layer_sync tax generalizes to the
+  30B by layer count (×48).** Probe 1 already says the barrier is worth pursuing;
+  Probe 2 (clean) sizes exactly how much of layer_sync is recoverable.
+- **Probe 2 CLEAN (2026-07-27, Llama-3.2-1B-4bit, 16 layers, resident, spreads
+  0.6%/2.6%, streams identical): layer barrier ON=14.83 / OFF=10.54 ms/token, gap
+  4.29 ms = 0.268 ms/LAYER recoverable.** Cross-checks Probe 1: 0.268 ≈ the 0.219
+  ms L_eval floor — the layer barrier IS ~one eval round-trip/layer, independently
+  confirmed. **Projection to 30B: 0.268 × 48 = ~12.9 ms/token ≈ 8.7% end-to-end**
+  (vs 147.1 ms/token). This REFINES #16: of the 28 ms it attributed to layer_sync
+  on the 30B, only ~13 ms is RECOVERABLE (the round-trip); the other ~15 ms is
+  drained compute that re-materializes at the next sync. So M4-narrow (drop just
+  the per-layer mx.eval(h) via eviction-pinning) has an ~8.7% CEILING — under a
+  10% gate on its own. The gate-clearing target is the FULL eval-barrier bucket:
+  Probe 1's 116.6 evals/token × 0.219 = ~25 ms ≈ 17% end-to-end, reachable only by
+  pinning BOTH the scatter eval AND the layer eval per layer to approach the
+  resident regime's barrier count — a real Plan-9 shape (eviction-lifetime
+  correctness, Opus-level). VERIFICATION COMPLETE: barrier reduction is a real
+  lever (both probes agree, mutually cross-checked); layer-only ~9%, all-eval ~17%
+  ceiling; router_sync stays crossed off (irreducible).
+- **CATCH found scoping Plan 9 (mechanism dig, 2026-07-27): the 8.7% is a
+  RESIDENCY CEILING, not streaming-realizable.** The per-layer `mx.eval(h)` is
+  MEMORY-LOAD-BEARING — MLX refcounts a lazy graph's inputs, so deferring the eval
+  keeps every layer's weights alive and `_evict_locked`+`mx.clear_cache` can't
+  free them; the barrier is what lets layer N's weights drop before N+1 loads
+  (which is exactly why it's skipped ONLY under `_fully_resident`, the regime the
+  clean 1B Probe 2 ran). On the streaming 30B, dropping it accumulates the whole
+  token's weight set → exceeds budget → #15 churn → net slower. So the lever is
+  WINDOWED eval (drain every W-th layer; peak ≈ W layers' weights), recovering
+  `(W-1)/W·12.9 ms` but bounded by slack under the wire — realistic ~4–7%, maybe
+  under the 10% gate. MLX refcounting pins graph-referenced buffers, so windowed
+  eval is bit-identical with NO explicit pin API → the realizability probe is
+  cheap. **→ Plan 9 SCOPED (docs/plan9-barrier-window.md); M0 =
+  scripts/windowed_eval_probe.py, a flushed ABBA W-sweep {1,2,3,4} on the 30B with
+  a #15 compression validity gate. GATE: some in-band W ≥ +10% vs W=1, else Plan 9
+  dies here. Run it before any engine build.**
+- **Plan 9 M0 FIRST PASS 2026-07-27: PROMISING, gate call warmup-biased, clean
+  re-run pending.** Clean peak at W=3, streams identical, **zero compression at
+  every W** (memory-load-bearing risk did NOT bind at W≤4 on 10 GB). Reported W=3
+  +14.08% — but the two W=1 runs were 7.147 (cold run 1) vs 8.048 (warm run 8):
+  purge no-op'd so only run 1 hit cold disk, and the symmetric order sat W=1 at
+  both ends, deflating its mean and inflating deltas. Warm-only ≈ +7–8%,
+  borderline UNDER gate. True figure 8–14%, undecided. Probe hardened (discard a
+  warmup run, REPS=3, median). Bigger-than-8.7%-ceiling win, if real, is
+  CROSS-LAYER OVERLAP (compute of layer N over host prep of N+1) that the isolated
+  1B Probe 2 couldn't see — a reason the lever may be better than the barrier
+  math alone suggested. Re-run decides M0.
+- **Plan 9 M0 CLEAN RESULT 2026-07-27: GATE FAILED (+7.61% < 10%).** Medians of 3:
+  W=1 8.025, W=2 8.363, **W=3 8.636 (+7.61%)**, W=4 8.426; streams identical; zero
+  compression at every W (memory risk never bound). Median rejected another
+  cold-start outlier (raw W=1 run1 = 5.13). The warmup-fixed number (7.6%)
+  confirms the first-pass +14% was a cold-disk mirage, and bookends the chain:
+  isolated barrier ceiling 8.7% (Probe 2) → streaming-realizable 7.6% (M0), just
+  under. **Plan 9 does NOT proceed as a default-on plan.** But +7.6% is real,
+  lossless (bit-identical), ~5-line, and churn-free at W≤4 → OPEN: ship as an
+  opt-in `eval_window` flag (default W=1=off, with a memory-aware W guard so
+  tighter budgets can't churn), or park. User's call — a shipping decision, not a
+  measurement. Precedent: Plan 8 shipped compact_scatter opt-in below its gate.
+- **DECISION 2026-07-27: SHIP OPT-IN. `eval_window` M1-lite IMPLEMENTED**
+  (engine `_sync_layer` windowed drain + wire-proximity churn guard; CLI
+  `--eval-window`; serve plumbing; tests/test_eval_window.py bit-identity on
+  qwen3_moe/gpt_oss/dense-llama × fp16/4-bit; default W=1 = today, exact). NOT
+  default-on (M0 under bar). plan9 M1-lite. Pending: `uv run pytest`. Plan-9 M2/M3
+  (the default-on A/B gate) stay FROZEN — revisit only if a config shows a bigger
+  windowing win. This closes the post-#16 barrier investigation: layer_sync is a
+  real but sub-gate lever, now captured opt-in; router_sync irreducible; the
+  remaining decode headroom on 16 GB is model/quant choice, not engine scheduling.
+
+**Do NOT** re-target I/O prefetch/warming on this hardware class off the back of
+this — I/O is 17%, and #9/#15 already buried those. Re-check the bucket split
+first on any new machine/model (the probe reports it); on a bigger model or
+tighter budget the disk share rises and the calculus shifts.
+
+## 17. Compact-stack scatter for MULTI-TOKEN VERIFY passes (PARKED lead from Plan 8 M2, 2026-07-27)
+
+Plan 8's compact-via-`mx.stack` scatter is a measured DEAD lever for single-token
+greedy decode (#16 / plan8 M2: ~3–4% end-to-end, under the 10% gate). But the same
+M2 micro-bench shows its win GROWS with the fired-expert count k: at the
+verify-union k=70 (qwen3-30b), compact-stack C=226.6 vs the persistent-full
+default B=325.2 ms/tok-over-48-layers — a **−30%** cut of the scatter+eval bucket,
+6× the decode-k win. Multi-token verify/tree passes (speculative_generate,
+tree_forward, batched_generate) scatter the DISTINCT-EXPERT UNION across K tokens,
+so k there is 51–70% of num_experts, not 8 — exactly the regime where compact
+wins big and the full `[num_experts,…]` eval is most wasteful.
+
+Unproven and NOT yet worth Mac time: whether scatter is a large enough slice of a
+verify FORWARD (which also pays K× the attention + FFN matmul) for a −30% scatter
+cut to move end-to-end speculative throughput. Needs its OWN attribution first —
+the #16 probe measured single-token decode; a verify-pass probe (buckets under
+speculative_generate at union k) is the prerequisite before any M3-on-spec gate.
+The mechanism already exists and is correct: `StreamingEngine(compact_scatter=
+True)` now uses stack (plan8 M1 corrected post-M2) and is bit-identical — flip it
+on for verify only, or globally, once/if a verify attribution justifies it.
+Pursue only if speculative-decode throughput becomes a priority.
